@@ -1,0 +1,13 @@
+# agentbox mask patterns — gitignore syntax
+# Files matched here are unreadable from inside the box.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_ed25519
+*.p12
+*.pfx
+credentials.json
+secrets/

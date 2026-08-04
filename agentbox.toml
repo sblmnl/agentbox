@@ -1,0 +1,22 @@
+# agentbox project configuration — see agentbox.toml(5)
+version = 1
+
+[agents]
+install = ["claude-code"]   # bake the `claude` binary into the image
+channel = "stable"
+
+[toolchains]
+go = "1.26.5"               # must match the `go` directive in go.mod (GOTOOLCHAIN=local)
+
+[network]
+mode    = "proxy"
+bundles = [
+    "agent:claude-code",    # the agent's own egress
+    "github",               # gh CLI / PRs / git over https
+    "go",                   # proxy.golang.org + sum.golang.org for module fetch
+]
+allow   = []
+
+[security]
+min_isolation = "vm"
+mask_mode = "filter"

@@ -1,0 +1,213 @@
+.TH AGENTBOX-SECURITY 7 "2026" "agentbox 0.0.1-dev" "Miscellaneous"
+.SH NAME
+agentbox-security \- what agentbox does and does not protect against
+.SH STATUS
+.B Experimental and educational \(em not for security-sensitive use.
+agentbox is an unaudited personal project written without professional
+expertise in Go or low-level container/VM sandboxing, and its security
+reasoning has not been independently reviewed. The model described here is
+design intent under active development, not a vetted guarantee. Do not rely
+on it to contain untrusted or malicious code, or to protect real secrets;
+assume escapes and mistakes are possible.
+.SH HONEST FRAMING
+agentbox does not make it \[dq]safe\[dq] to run an agent unattended, and its
+two isolation tiers are not equivalent. The accurate claim is narrower: the
+blast radius of an agent mistake is reduced to one workspace tree and one
+egress allowlist, both inspectable beforehand
+.RB ( "agentbox mounts" ", " masks ", " "config \-\-origin" ", " \-\-dry\-run )
+and logged after
+.RB ( "logs \-\-denied" ).
+That is what makes skipping interactive approval a defensible engineering
+decision rather than a reckless one. It is not the same claim as safety,
+and the two tiers do not reduce that radius equally.
+.SH THREAT MODEL
+.B In scope:
+an agent that is careless, overconfident, or acting on a prompt injection
+from content it read; a workspace dependency with a malicious install
+script attempting credential theft or exfiltration; accidental destruction
+outside the workspace. Under the vm tier, additionally: an exploit
+achieving container escape.
+.PP
+.B Out of scope:
+hypervisor escape; under the container tier, kernel and runtime escape;
+side channels; a determined adversary who already has code execution and
+specifically targets this configuration; anything reachable via the
+workspace's own git remote and CI credentials if those are mounted in.
+.SH ENFORCED PROPERTIES BY TIER
+.TS
+box tab(|);
+lb | lb | lb
+l | l | l.
+Property|container|vm
+_
+Kernel boundary|Shared with host|Private guest kernel
+Escape class in scope|\(em|Container escape
+Escape class out of scope|Kernel/runtime vulnerability|Hypervisor vulnerability
+Guest root available|No, by construction|Optional (security.vm.guest_root)
+Mask enforcement point|Host mount namespace|Host mount ns or share daemon
+Mask survives guest root|Not applicable|Yes
+Mid-session file masked|No (view)|Yes (filter)
+Nested container engine|Forbidden \(em equals host root|Permitted, guest-local
+Capability restriction|cap_drop: ALL|Not applicable
+Setuid removal|Yes|Yes (image property)
+Read-only root|Yes|Guest-local, weaker meaning
+Resource limits|Host cgroup, agent cannot raise|Guest-visible; guest root may raise
+Egress control|Host-side sidecar proxy|Host daemon over vsock
+Inter-box reachability|Denied by network topology|Denied by network topology
+Cross-box state access|Denied \(em separate volumes/views|Denied \(em separate disks/views
+Startup cost|~100 ms|seconds
+Memory model|Shares host page cache|Private kernel and page cache
+Requires KVM / nested virt|No|Yes
+.TE
+.PP
+The current release implements both tiers. The vm tier runs on an
+OCI-consuming VM runtime \(em Kata Containers (docker) or libkrun (podman)
+\(em and requires /dev/kvm. Where hardware or runtime is missing, a project
+declaring
+.B min_isolation = \[dq]vm\[dq]
+exits 69 naming what would fix it rather than silently substituting the
+weaker tier. The Layer 3 filtered share (mask_mode = \[dq]filter\[dq])
+ships in this release: under vm, \[dq]auto\[dq] resolves to
+\[dq]filter\[dq] where the seam is deliverable (/dev/fuse present, plus
+either agentbox running as root or the setuid fusermount3 helper with
+user_allow_other enabled in /etc/fuse.conf) and falls back to
+\[dq]view\[dq] with a warning on stderr otherwise; an explicit
+\[dq]filter\[dq] that cannot be delivered is an error, never a downgrade.
+The share daemon needs no privilege of its own on the helper route: the
+masks hold because the daemon sits outside the guest, not because it is
+root.
+.SH UNIVERSAL REFUSALS
+Under both tiers, agentbox refuses to construct a box with host networking,
+a host PID namespace, a mounted host container-runtime socket, or an
+unconfined seccomp profile \(em any one of these makes the rest decorative,
+and a mounted runtime socket in particular is equivalent to handing the
+agent root on the host.
+.PP
+Boxes cannot reach one another, over the network or through shared state:
+each box gets its own network, its own persistent home, and its own mask
+view. The single deliberate exception is
+.BR "tree_mode = \[dq]shared\[dq]" ,
+where boxes see one working tree by explicit configuration, warned at
+creation.
+.SH MASKING
+Masking constructs the masked view on the host side of the filesystem
+boundary and presents that to the guest, so enforcement does not depend on
+the guest's privilege level. Under view mode, matched files are covered
+read-only (reads return EOF, writes fail) and matched directories appear
+empty, with writes landing in memory and never reaching the host. Under
+filter mode (vm tier), the workspace is served by agentbox's own share
+daemon evaluating the patterns at every lookup: a masked path answers
+ENOENT and is omitted from directory listings, and creating, linking, or
+renaming onto a masked name fails EPERM. Renaming a directory that hides a
+masked entry fails EBUSY, so an anchored pattern cannot be dodged by moving
+an ancestor out from under it \(em the same move view mode blocks because
+the masked path is a live mountpoint. The daemon compiles its patterns
+from contents frozen host-side at box start, so editing
+.B .agentignore
+inside the box cannot unmask anything.
+.PP
+Documented limitations, scoped to the mode they apply to:
+.IP 1. 4
+.B Mounts are fixed at creation (view mode only).
+A path that does not exist when the box is created cannot be masked; a
+.B .env
+the agent writes mid-session is readable. Under filter mode this does not
+apply: the filter is evaluated live, and a matching file is masked the
+moment it appears.
+.IP 2. 4
+.B A masked directory is a small writable ramdisk, not a hole (view mode only).
+Masking a directory the toolchain builds into \(em
+.BR node_modules ", " obj/ ", " .venv/
+\(em fails the build once it exceeds
+.BR masking.tmpfs_size .
+Under filter mode there is no tmpfs; a masked directory simply does not
+exist in the guest.
+.IP 3. 4
+.B .git/ should not be masked.
+It costs diff, commit, and history for almost no gain.
+.B doctor
+warns when a config does this.
+.IP 4. 4
+.B Anything in [[workspace.mounts]] bypasses masking
+unless separately matched.
+.IP 5. 4
+.B Masking is not a secrets manager.
+For credentials that need not sit in the tree at all, prefer
+.B [variables.passthrough]
+or keeping the secret host-side. Masking exists for files an application
+genuinely needs on disk to run \(em a dev TLS key, a seeded database \(em
+where deleting them to run an agent would cost the ability to debug at all.
+.SH NETWORK POLICY
+In the default
+.B proxy
+mode the guest has no route to any external address; all egress goes
+through a policy proxy evaluating a default-deny allowlist, so a tool that
+ignores
+.B HTTPS_PROXY
+fails closed rather than escaping. TLS is not intercepted: the proxy
+matches on the CONNECT target, leaving certificate validation end-to-end.
+Every request, including denials, is logged.
+.B deny
+entries are evaluated first and win. An HTTP CONNECT proxy cannot carry
+SSH: git operations must use HTTPS remotes in proxy mode, and
+.B doctor
+detects SSH remotes rather than leaving you to discover this mid-session.
+.PP
+The tiers place the proxy differently. Under the container tier it is a
+sidecar container straddling the box's internal network and an egress
+network. Under the vm tier it is a host daemon reached over
+.BR vsock :
+a forwarder inside the box listens on loopback, which is what
+.B HTTPS_PROXY
+points at, and carries connections to the daemon over the hypervisor
+channel; the box network stays internal and carries no egress. A guest's
+path to a host process over the bridge would be ordinary IP traffic subject
+to the host's INPUT policy and to VPN kill-switches that accept only RFC
+1918 as local, either of which drops it invisibly and leaves the box looking
+healthy while every network call hangs. vsock has no address to filter.
+Boxes are attributed by a per-box token minted at create time; a connection
+whose token matches no running box is closed unserved, and the audit log
+records the unforgeable peer context id.
+.SH GUEST ROOT
+Under the container tier, guest root is denied by construction: the image
+has no sudo, setuid bits are stripped, and
+.B guest_root = \[dq]allow\[dq]
+under
+.B [security.container]
+is a parse error. The reasoning: a guest process with CAP_SYS_ADMIN could
+unmount a mask and read through it, converting every mask from a boundary
+into a suggestion \(em silently, with no error and no log line. The vm tier
+is where the frequent agent request for root can be granted, because mask
+enforcement lives outside the guest.
+.SH WORKSPACE CONFIG TRUST
+.B agentbox.toml
+is committed, so cloning a repository executes configuration you did not
+write. Host-side
+.B [hooks]
+and
+.B [[workspace.mounts]]
+are refused until the file is reviewed and accepted with
+.BR "agentbox trust" ;
+any edit invalidates the trust record. Inspection commands
+.RB ( config ", " mounts ", " doctor ", ...)"
+still work against an untrusted config \(em they are how you review it.
+.SH NO SILENT DIVERGENCE
+One configuration file drives two non-equivalent boundaries, so divergence
+must be loud:
+.B status
+prints the active backend, tier, and mask mode on every invocation;
+.B doctor
+names each unavailable backend and why;
+.B min_isolation
+is honored without downgrade;
+backend-specific keys are scope-checked statically on every machine; a box
+created with
+.B \-\-force\-isolation
+warns on every invocation and is flagged by
+.BR status " and " ls .
+The failure mode defended against is concrete: a configuration verified on
+a bare-metal workstation runs weaker inside a colleague's cloud VM while
+every command still succeeds.
+.SH SEE ALSO
+.BR agentbox (1),
+.BR agentbox.toml (5)

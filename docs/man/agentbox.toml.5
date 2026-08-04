@@ -1,0 +1,312 @@
+.TH AGENTBOX.TOML 5 "2026" "agentbox 0.0.1-dev" "File Formats"
+.SH NAME
+agentbox.toml \- project configuration for agentbox
+.SH SYNOPSIS
+.B agentbox.toml
+or
+.B .agentbox.toml
+at the workspace root (both present is an error).
+.SH DESCRIPTION
+Configuration is merged from seven layers, lowest to highest precedence:
+built-in defaults;
+.BR /etc/agentbox/config.toml ;
+.BR $XDG_CONFIG_HOME/agentbox/config.toml ;
+the workspace file this page describes; a profile overlay named by
+.BR \-\-profile ,
+.BR AGENTBOX_PROFILE ,
+or
+.IR [box].profile ;
+.B AGENTBOX_*
+environment variables; command-line flags.
+.PP
+Exactly one workspace file participates \(em the one at the workspace root.
+Configurations are not merged across intermediate directories; a monorepo
+subdirectory wanting different settings should use a profile. A file may set
+.B extends = \[dq]PATH\[dq]
+to include another as a lower-precedence layer.
+.PP
+Scalars and tables: a higher layer replaces. Arrays:
+.BR append ,
+with two escapes:
+.B \[dq]!reset\[dq]
+as an element discards everything inherited so far for that key, and
+.B \[dq]!value\[dq]
+removes
+.I value
+if inherited.
+.B agentbox config \-\-origin
+reports, per key, the layer that supplied the final value.
+.PP
+Unknown keys are a hard error: a silently ignored
+.I securiy
+block is a security bug. Backend-specific keys must appear only inside
+.B [security.container]
+or
+.BR [security.vm] ;
+a backend-specific key at a neutral level is a schema error on every
+machine, regardless of which backend is active, so a config authored on a
+laptop fails identically on a colleague's cloud VM rather than silently
+weakening.
+.SH TRUST
+The workspace file is committed, so cloning a repository and running
+.B agentbox
+executes configuration you did not write.
+.B [hooks]
+(commands run on the host) and
+.B [[workspace.mounts]]
+(host paths exposed to the guest) are therefore refused until the file has
+been reviewed and accepted with
+.BR "agentbox trust" .
+Any edit to the file or its
+.B extends
+chain invalidates trust. See
+.BR agentbox (1).
+.SH SCHEMA
+.nf
+version = 1
+
+[box]
+name            = "myapp"        # display only
+profile         = "dotnet"
+default_command = ["bash", "-l"]
+default_agent   = "claude"
+idle_timeout    = "30m"          # stop after this long with no exec; "0" disables
+
+[project]
+max_boxes = 4                    # refuse to create beyond this; 0 = unlimited
+
+[workspace]
+mount     = "/workspace"
+readonly  = false
+tree_mode = "auto"               # "auto" | "shared" | "worktree" | "copy"
+
+[[workspace.mounts]]             # requires trust; bypasses masking
+source = "~/.gitconfig"
+target = "/home/agent/.gitconfig"
+mode   = "ro"
+
+[toolchains]
+dotnet = "10"
+node   = "24"
+python = "3.13"
+
+[image]
+# ref = "ghcr.io/me/box:2026-06"  # prebuilt OCI image, verbatim; toolchains ignored
+# dockerfile = "Dockerfile"        # a Dockerfile you own, built as-is; relative to
+                                   # this config's dir (e.g. $XDG_CONFIG_HOME/agentbox
+                                   # for a global baseline). toolchains then ignored;
+                                   # it must create the agent user from the
+                                   # AGENTBOX_UID/AGENTBOX_GID build args.
+base       = "ubuntu:26.04"        # base agentbox layers onto, or any OCI ref
+packages   = ["postgresql-client"]
+build_args = { TZ = "UTC" }
+
+[agents]
+install = ["claude-code"]
+channel = "stable"
+
+[network]
+mode    = "proxy"                # "none" | "proxy" | "open"
+bundles = ["agent:claude-code", "github", "npm"]
+allow   = ["registry.internal.example.com"]
+deny    = []
+audit   = true
+
+[network.proxy]
+read_timeout    = "1h"
+request_timeout = "5m"
+
+[resources]
+memory     = "8g"
+cpus       = 4
+pids       = 4096
+tmpfs_size = "4g"
+nofile     = 65536
+
+[security]                       # neutral keys only
+min_isolation = "container"      # "container" | "vm"
+strip_setuid  = true
+mask_mode     = "auto"           # "auto" | "view" | "filter"
+
+[security.container]
+read_only_root    = true
+no_new_privileges = true
+cap_drop          = ["ALL"]
+cap_add           = []           # non-empty warns
+userns            = "auto"
+seccomp           = "default"
+guest_root        = "deny"       # "deny" only; "allow" is a parse error here
+
+[security.vm]
+hypervisor     = "auto"
+runtime        = "auto"
+guest_root     = "allow"         # "allow" | "deny"
+nested_docker  = false           # safe only under this tier
+memory_backing = "balloon"
+
+[masking]
+ignore_files   = [".agentignore"]
+tmpfs_size     = "1m"
+files_readonly = true
+
+[variables]
+TZ = "UTC"
+
+[variables.passthrough]
+names = ["ANTHROPIC_API_KEY", "GH_TOKEN"]
+
+[hooks]                          # requires trust; run on the HOST
+pre_up   = []
+post_up  = []
+pre_exec = []
+
+[profiles.airgapped]
+[profiles.airgapped.network]
+mode = "none"
+.fi
+.PP
+User- or system-level configuration may additionally set:
+.nf
+
+[limits]
+max_boxes        = 12            # across all projects
+max_total_memory = "48g"         # sum of running boxes' limits
+on_limit         = "error"       # "error" | "reap-idle"
+.fi
+.SH KEY NOTES
+.TP
+.B image (customization)
+Three ways to decide the image, highest precedence first:
+.B image.ref
+(a prebuilt OCI image, used verbatim; agentbox adds no layers),
+.B image.dockerfile
+(a Dockerfile you own, built as-is; path relative to the config file's
+directory), and the default generated Dockerfile built from
+.B image.base
++
+.BR [toolchains] " + " image.packages " + " [agents] .
+Setting
+.B ref
+or
+.B dockerfile
+takes ownership of the image: declared toolchains are then ignored, and
+agentbox
+.I warns
+so the override is never silent (setting both warns that
+.B ref
+wins). The generated tag is a feature digest over base, toolchains,
+packages, agents, and build args, so editing any of them rebuilds
+automatically; a supplied Dockerfile is digested by its contents. A custom
+Dockerfile must consume the
+.B AGENTBOX_UID
+/
+.B AGENTBOX_GID
+build args (create the agent user with them, or uid mapping and mask
+ownership break) and
+.B AGENTBOX_GUEST_ROOT
+(install sudo when \[dq]allow\[dq], absent when \[dq]deny\[dq]).
+.B agentbox build
+forces a rebuild.
+.TP
+.B security.min_isolation
+Declares the weakest isolation tier the project accepts. When no available
+backend meets it, agentbox exits 69 naming what is missing. Silent
+downgrade never occurs; neither does warned downgrade. Lowering requires
+.BR "\-\-force\-isolation" ,
+which is recorded and warned about on every invocation of the resulting
+box.
+.TP
+.B workspace.tree_mode
+How concurrent boxes obtain a working tree.
+.B shared
+mounts the workspace directly;
+.B worktree
+gives the box its own git worktree on its own branch (kept outside the
+workspace, under the state directory);
+.B copy
+gives a private copy;
+.B auto
+uses shared for the first box and worktree (or copy for non-git trees) for
+each additional one. Creating a second shared box warns, naming the boxes
+already mounting the tree: two agents editing one tree overwrite each
+other, and the corruption presents as inexplicable behavior rather than a
+conflict.
+.TP
+.B security.mask_mode
+.B view
+masks by host-side mounts under both tiers;
+.B filter
+masks at lookup time in agentbox's own share daemon, available only under
+the vm tier \(em requesting it under container is an error, not a
+downgrade. Under filter, masked paths answer ENOENT and are omitted from
+directory listings, the filter is evaluated live (a matching file created
+mid-session is masked), and masked directories impose no tmpfs size cap.
+Delivering it needs /dev/fuse plus a mount route: agentbox running as root,
+or the setuid fusermount3 helper with user_allow_other enabled in
+/etc/fuse.conf, which lets the share daemon run entirely in the user's
+context. Requesting it where neither route exists is an error naming what
+would fix it.
+.B auto
+selects filter where available, else view; the vm-tier fallback to view is
+announced on stderr, and
+.B agentbox doctor
+reports which way auto resolves on this host.
+.TP
+.B guest_root
+Exists with value
+.B \[dq]allow\[dq]
+only under
+.BR [security.vm] :
+under the container tier a root guest could unmount masks, silently turning
+every mask from a boundary into a suggestion. Writing it under
+.B [security.container]
+is a parse error everywhere. Similarly
+.B nested_docker
+exists only under vm, and
+.B cap_drop
+only under container.
+.TP
+.B resources.pids
+Neutral, but enforced differently: the container backend enforces it in the
+host cgroup where the agent cannot raise it; the VM backend enforces it
+inside the guest where a guest-root agent could.
+.TP
+.B masking (.agentignore)
+Patterns use
+.BR gitignore (5)
+syntax exactly:
+.B !
+negation with last-match-wins, trailing
+.B /
+for directories, leading or embedded
+.B /
+anchoring,
+.B **
+crossing separators, character classes. A user-global
+.B $XDG_CONFIG_HOME/agentbox/agentignore
+is applied below the workspace's ignore files, so
+.B *.pem
+and
+.B id_rsa
+can be masked in every project without restatement.
+.TP
+.B [variables.passthrough]
+For credentials that need not sit in the tree, prefer passthrough (or the
+planned proxy credential injection) over committing them and masking them.
+Masking exists for files an application genuinely needs on disk to run.
+.SH ENVIRONMENT LAYER
+.B AGENTBOX_SECTION__KEY=value
+sets
+.IR section.key ;
+double underscore separates path components. For example
+.B AGENTBOX_NETWORK__MODE=none
+sets
+.IR network.mode .
+.B AGENTBOX_PROFILE
+and
+.B AGENTBOX_WORKSPACE
+are reserved and not part of the config tree.
+.SH SEE ALSO
+.BR agentbox (1),
+.BR agentbox-security (7),
+.BR gitignore (5)

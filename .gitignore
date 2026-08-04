@@ -1,0 +1,14 @@
+# binaries and generated artifacts
+/agentbox
+/dist/
+/completions/
+
+# go
+*.test
+*.out
+coverage.html
+
+# editors
+.idea/
+.vscode/
+*.swp

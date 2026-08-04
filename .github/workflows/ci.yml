@@ -1,0 +1,137 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: make fmt-check
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build -trimpath ./cmd/agentbox
+      - name: test
+        # The ignore-matcher suite differentially tests against
+        # `git check-ignore` (present on the runner).
+        run: go test ./...
+
+  # The Layer-0 mask-view test exercises real mounts and needs
+  # CAP_SYS_ADMIN. It skips visibly without privilege, so it gets its own
+  # job that fails if the test skipped rather than ran.
+  mask-privileged:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: layer-0 real mounts (root)
+        run: |
+          sudo env "PATH=$PATH" go test -run TestLayer0RealMounts ./internal/mask/ -v | tee out.txt
+          if grep -q 'SKIP' out.txt; then
+            echo "privileged mask test skipped instead of running" >&2
+            exit 1
+          fi
+      - name: layer-3 filtered share, real FUSE mount (root)
+        run: |
+          sudo env "PATH=$PATH" go test -run TestFilterRealMount ./internal/share/ -v | tee out3.txt
+          if grep -q 'SKIP' out3.txt; then
+            echo "privileged filter test skipped instead of running" >&2
+            exit 1
+          fi
+
+  # The VM conformance suite on a KVM-capable runner
+  # (GitHub-hosted Linux runners expose /dev/kvm). A CI configuration that
+  # skips this suite MUST NOT report success, so the job fails when the
+  # suite skips rather than runs — a green build that silently omitted the
+  # conformance suite is the failure mode this job exists to prevent.
+  vm-conformance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: enable /dev/kvm for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm
+      - name: install kata containers (static release)
+        env:
+          KATA_VERSION: "3.10.1"
+        run: |
+          curl -fsSL -o kata.tar.xz \
+            "https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-amd64.tar.xz"
+          sudo tar -xf kata.tar.xz -C /
+          sudo ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
+          sudo ln -sf /opt/kata/bin/kata-runtime /usr/local/bin/kata-runtime
+          kata-runtime --version
+      - name: register the kata runtime with docker
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{ "runtimes": { "kata": { "runtimeType": "io.containerd.kata.v2" } } }' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info --format '{{json .Runtimes}}' | grep -q kata
+      - name: run the vm conformance suite (root — host-side mask view)
+        run: |
+          go build -o agentbox ./cmd/agentbox
+          sudo env "PATH=$PATH" \
+            AGENTBOX_VM_CONFORMANCE=1 AGENTBOX_BIN="$GITHUB_WORKSPACE/agentbox" \
+            go test -v -count=1 -timeout 30m ./test/vmconformance/ | tee vm-out.txt
+          if grep -Eq -- '--- SKIP' vm-out.txt; then
+            echo "vm conformance suite skipped instead of running" >&2
+            exit 1
+          fi
+
+  cli-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: go build ./cmd/agentbox
+      - name: smoke
+        run: |
+          set -x
+          ./agentbox help
+          ./agentbox version --json
+          ./agentbox completion bash > /dev/null
+          ./agentbox completion zsh  > /dev/null
+          ./agentbox completion fish > /dev/null
+          mkdir -p /tmp/smoke && cd /tmp/smoke && git init -q .
+          $GITHUB_WORKSPACE/agentbox init
+          $GITHUB_WORKSPACE/agentbox doctor || true   # docker may be absent
+          $GITHUB_WORKSPACE/agentbox config --origin > /dev/null
+          $GITHUB_WORKSPACE/agentbox trust --show
+          # Untrusted hooks must be refused with exit 77.
+          printf 'version = 1\n[hooks]\npre_up = ["true"]\n' > agentbox.toml
+          rc=0; $GITHUB_WORKSPACE/agentbox run true || rc=$?
+          test "$rc" = "77"
+          $GITHUB_WORKSPACE/agentbox trust
+
+  man-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install mandoc
+        run: sudo apt-get update -q && sudo apt-get install -y mandoc groff
+      - name: lint man pages
+        run: make man-lint
