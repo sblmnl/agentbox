@@ -17,7 +17,7 @@ import (
 
 // GeneratorVersion participates in the feature digest so that generator
 // changes produce new tags.
-const GeneratorVersion = "1"
+const GeneratorVersion = "2"
 
 // Features is the canonical input to the digest.
 type Features struct {
@@ -145,7 +145,6 @@ func hashDockerfileFile(path string) (string, error) {
 // in and the build fails on mismatch.
 var repoKeyFingerprints = map[string]string{
 	"nodesource":  "6F71F525282841EEDAF851B42F59B5F99B1BE0B4",
-	"microsoft":   "BC528686B50D79E339D3721CEB3E94ADBE1229CF",
 	"claude-code": "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE",
 }
 
@@ -170,8 +169,11 @@ func Dockerfile(cfg *config.Config, uid, gid int) string {
 	w("")
 	w("ENV DEBIAN_FRONTEND=noninteractive")
 
-	// Baseline agent tooling regardless of toolchains.
-	base := []string{"git", "ripgrep", "fd-find", "jq", "curl", "less", "tmux", "sqlite3", "unzip", "ca-certificates", "openssh-client", "locales"}
+	// Baseline agent tooling regardless of toolchains. gnupg is part of the
+	// baseline because every apt-repo step below verifies a signing-key
+	// fingerprint with gpg before trusting it, and no supported base image
+	// ships gnupg.
+	base := []string{"git", "ripgrep", "fd-find", "jq", "curl", "less", "tmux", "sqlite3", "unzip", "ca-certificates", "gnupg", "openssh-client", "locales"}
 	pkgs := append(base, cfg.Image.Packages...)
 	sort.Strings(pkgs)
 	w("RUN apt-get update && apt-get install -y --no-install-recommends \\")
@@ -204,9 +206,9 @@ func Dockerfile(cfg *config.Config, uid, gid int) string {
 	}
 
 	// Toolchain caches and global prefixes under the persistent home.
+	// No PIPX_*: pipx is not installed. `uv tool install` covers it, and uv
+	// already defaults to ~/.local/bin, which is on PATH below.
 	w("ENV NPM_CONFIG_PREFIX=/home/agent/.npm-global \\")
-	w("    PIPX_HOME=/home/agent/.local/pipx \\")
-	w("    PIPX_BIN_DIR=/home/agent/.local/bin \\")
 	w("    UV_CACHE_DIR=/home/agent/.cache/uv \\")
 	w("    NUGET_PACKAGES=/home/agent/.nuget/packages \\")
 	w("    DOTNET_BUNDLE_EXTRACT_BASE_DIR=/home/agent/.cache/dotnet-bundle \\")
@@ -255,23 +257,36 @@ func writeToolchain(w func(string, ...any), name, version string) {
 		w("    echo \"deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_%s.x nodistro main\" > /etc/apt/sources.list.d/nodesource.list; \\", version)
 		w("    apt-get update && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*")
 	case "python":
-		w("# toolchain: python %s via uv (PEP 668: system pip is externally managed)", version)
+		// uv owns the interpreter outright and no distro python is installed
+		// beside it. A second python on PATH is what let a failed install
+		// pass for success: `python3` answered, from the distro, at a version
+		// nobody asked for. With one interpreter, a broken install is a
+		// missing command instead of a silent downgrade.
+		//
+		// /opt, not a home directory: the build runs as root, the box runs as
+		// `agent`, and /home/agent is a persistent volume that shadows the
+		// image after first creation — either would install it out of reach.
+		w("# toolchain: python %s via uv (sole interpreter; no distro python alongside)", version)
 		w("RUN set -eu; \\")
-		w("    apt-get update && apt-get install -y --no-install-recommends python3 python3-venv pipx && rm -rf /var/lib/apt/lists/*; \\")
 		w("    curl -fsSL https://astral.sh/uv/install.sh -o /tmp/uv.sh; \\")
 		w("    env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh /tmp/uv.sh; \\")
-		w("    /usr/local/bin/uv python install %s", version)
+		w("    env UV_PYTHON_INSTALL_DIR=/opt/uv/python UV_PYTHON_BIN_DIR=/usr/local/bin \\")
+		w("      /usr/local/bin/uv python install --default %s; \\", version)
+		w("    chmod -R a+rX /opt/uv; \\")
+		// Fail the build, not the box: assert the interpreter on PATH is the
+		// requested one rather than something a dependency dragged in.
+		w("    got=$(python3 --version); \\")
+		w("    case \"$got\" in \"Python %s\"*) ;; \\", version)
+		w("      *) echo \"python: wanted %s, got $got\" >&2; exit 1;; esac", version)
+		w("ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python")
 	case "dotnet":
-		fp := repoKeyFingerprints["microsoft"]
-		w("# toolchain: dotnet %s (packages.microsoft.com, signing key fingerprint verified)", version)
-		w("RUN set -eu; \\")
-		w("    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc -o /tmp/ms.key; \\")
-		w("    gpg --dearmor < /tmp/ms.key > /usr/share/keyrings/microsoft.gpg; \\")
-		w("    actual=$(gpg --show-keys --with-fingerprint --with-colons /tmp/ms.key | awk -F: '/^fpr/{print $10; exit}'); \\")
-		w("    [ \"$actual\" = %q ] || { echo \"microsoft key fingerprint mismatch: $actual\" >&2; exit 1; }; \\", fp)
-		w("    . /etc/os-release; \\")
-		w("    echo \"deb [signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/$VERSION_ID/prod $VERSION_CODENAME main\" > /etc/apt/sources.list.d/microsoft.list; \\")
-		w("    apt-get update && apt-get install -y --no-install-recommends dotnet-sdk-%s.0 && rm -rf /var/lib/apt/lists/*", version)
+		// The distro archive, not packages.microsoft.com: Microsoft ships no
+		// .NET SDK there for Ubuntu >= 22.04 and points at the distro feed
+		// instead, so no third-party repo or trust anchor is added here.
+		w("# toolchain: dotnet %s (distro archive; Microsoft ships no SDK for this release)", version)
+		w("RUN apt-get update \\")
+		w("    && apt-get install -y --no-install-recommends dotnet-sdk-%s.0 \\", version)
+		w("    && rm -rf /var/lib/apt/lists/*")
 	case "go":
 		w("# toolchain: go %s (official tarball, checksum verified against dl.google.com)", version)
 		w("RUN set -eu; \\")
@@ -300,15 +315,13 @@ func writeAgent(w func(string, ...any), agent, channel string) {
 	case "claude-code":
 		fp := repoKeyFingerprints["claude-code"]
 		// [agents].channel selects the apt suite: "latest" ships every release,
-		// "stable" trails by ~a week. gnupg is installed locally for fingerprint
-		// verification so this step does not depend on the base image shipping it.
+		// "stable" trails by ~a week. gpg comes from the baseline package set.
 		suite := "stable"
 		if channel == "latest" {
 			suite = "latest"
 		}
 		w("# agent: claude-code (official apt repo, signing key fingerprint verified; no credentials in any layer)")
 		w("RUN set -eu; \\")
-		w("    apt-get update && apt-get install -y --no-install-recommends gnupg && rm -rf /var/lib/apt/lists/*; \\")
 		w("    install -d -m 0755 /etc/apt/keyrings; \\")
 		w("    curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o /etc/apt/keyrings/claude-code.asc; \\")
 		w("    actual=$(gpg --show-keys --with-fingerprint --with-colons /etc/apt/keyrings/claude-code.asc | awk -F: '/^fpr/{print $10; exit}'); \\")

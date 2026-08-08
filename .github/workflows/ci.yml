@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # toolchain-build below depends on third-party infrastructure that moves on
+  # its own schedule, not on ours, so it also runs nightly rather than only
+  # when someone happens to touch the repo.
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -126,6 +132,72 @@ jobs:
           rc=0; $GITHUB_WORKSPACE/agentbox run true || rc=$?
           test "$rc" = "77"
           $GITHUB_WORKSPACE/agentbox trust
+
+  # Every other test in this file asserts over the *text* of the generated
+  # Dockerfile, which can never catch upstream drift: a recipe that names a
+  # package no feed carries, or a repo layout that moved, passes those tests
+  # and fails every real build. The toolchain recipes are also the one part of
+  # agentbox that depends on infrastructure nobody here controls — third-party
+  # apt repos, signing keys, release tarballs, distro package names.
+  #
+  # So this job builds each toolchain for real and runs the installed compiler,
+  # asserting it is the *requested* version. Verification asserts rather than
+  # prints on purpose: a toolchain that installs to a path the `agent` user
+  # cannot reach is a silent fallback to whatever the distro ships, which is
+  # exactly the failure a `--version` smoke test scrolls straight past.
+  toolchain-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: node
+            version: "24"
+            verify: node --version | grep -q '^v24\.' && npm --version >/dev/null
+          - toolchain: dotnet
+            version: "10"
+            verify: dotnet --list-sdks | grep -q '^10\.'
+          - toolchain: python
+            version: "3.13"
+            # The uv-managed interpreter must be the one on PATH for the
+            # unprivileged user — not merely present somewhere. Asserting the
+            # path too, so a distro python arriving as some package's
+            # dependency and winning the lookup fails the job.
+            verify: test "$(command -v python3)" = /usr/local/bin/python3 && python3 --version | grep -q '^Python 3\.13\.' && python --version | grep -q '^Python 3\.13\.'
+          - toolchain: go
+            version: "1.26.5"
+            verify: go version | grep -q 'go1\.26\.5'
+          - toolchain: rust
+            version: stable
+            verify: rustc --version >/dev/null && cargo --version >/dev/null
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build agentbox
+        run: go build -trimpath -o "$RUNNER_TEMP/agentbox" ./cmd/agentbox
+      - name: build the ${{ matrix.toolchain }} image
+        run: |
+          set -eux
+          proj="$RUNNER_TEMP/tc"
+          mkdir -p "$proj" && git -C "$proj" init -q
+          printf 'version = 1\n[toolchains]\n%s = "%s"\n' \
+            '${{ matrix.toolchain }}' '${{ matrix.version }}' > "$proj/agentbox.toml"
+          cd "$proj" && "$RUNNER_TEMP/agentbox" build
+      - name: run the installed ${{ matrix.toolchain }} toolchain
+        # Through the environment, not ${{ }} interpolation: the snippets
+        # contain their own quoting, which would not survive being pasted
+        # inside a shell string.
+        env:
+          VERIFY: ${{ matrix.verify }}
+        run: |
+          set -eux
+          # One toolchain per runner, so the build leaves exactly one image.
+          tag=$(docker images --filter=reference='agentbox/dev:*' --format '{{.Repository}}:{{.Tag}}')
+          test "$(printf '%s\n' "$tag" | grep -c .)" = 1
+          # No --user: the image's own USER (agent) is what the box runs as.
+          docker run --rm -e VERIFY "$tag" bash -lc 'eval "$VERIFY"'
 
   man-lint:
     runs-on: ubuntu-latest

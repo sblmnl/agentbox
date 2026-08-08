@@ -184,8 +184,10 @@ machinery below it:
    honor the build-arg contract below.
 3. **Generated** (the default) — agentbox generates a Dockerfile from
    `image.base` + `[toolchains]` + `image.packages` + `[agents]`, layering in
-   a non-root `agent` user, toolchain installs (with pinned, fingerprint-
-   verified signing keys), the agent, and — when `security.strip_setuid` is
+   a non-root `agent` user, toolchain installs (preferring the distro
+   archive; where a third-party apt repo is genuinely required its signing
+   key is pinned by fingerprint and the build fails on mismatch, never
+   fetch-and-trust), the agent, and — when `security.strip_setuid` is
    set — a filesystem-wide setuid/setgid strip. This is the zero-Dockerfile
    path: declare `node = "24"` and get a working image.
 

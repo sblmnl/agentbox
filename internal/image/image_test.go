@@ -162,6 +162,77 @@ func TestClaudeCodeInstalledViaApt(t *testing.T) {
 	}
 }
 
+// Every apt-repo step verifies a signing-key fingerprint with gpg, which the
+// base images do not ship: gnupg must be installed before the first use, or
+// the build dies with "gpg: not found" and the key goes unverified.
+func TestGpgInstalledBeforeFirstUse(t *testing.T) {
+	cfg := cfgWith(t, "")
+	cfg.Toolchains = map[string]string{"node": "24", "dotnet": "10", "python": "3.13", "go": "1.26.0", "rust": "stable"}
+	cfg.Agents.Install = []string{"claude-code"}
+	df := Dockerfile(cfg, 1000, 1000)
+
+	install := strings.Index(df, "gnupg")
+	if install < 0 {
+		t.Fatal("gnupg is never installed, but the generated steps invoke gpg")
+	}
+	use := strings.Index(df, "gpg --")
+	if use < 0 {
+		t.Fatal("no gpg invocation found; this test no longer guards anything")
+	}
+	if use < install {
+		t.Errorf("gpg is invoked at byte %d, before gnupg is installed at %d", use, install)
+	}
+}
+
+// dotnet comes from the distro archive: packages.microsoft.com ships no .NET
+// SDK for Ubuntu >= 22.04, so pointing apt at it added a third-party trust
+// anchor and then failed to find the package.
+func TestDotnetFromDistroArchive(t *testing.T) {
+	cfg := cfgWith(t, "")
+	cfg.Toolchains = map[string]string{"dotnet": "10"}
+	df := Dockerfile(cfg, 1000, 1000)
+
+	if !strings.Contains(df, "apt-get install -y --no-install-recommends dotnet-sdk-10.0") {
+		t.Error("dotnet toolchain must install dotnet-sdk-10.0")
+	}
+	if strings.Contains(df, "packages.microsoft.com") {
+		t.Error("dotnet must not add the packages.microsoft.com repo: it carries no SDK for this release")
+	}
+	if strings.Contains(df, "sources.list.d/microsoft.list") {
+		t.Error("dotnet must not add a microsoft apt source")
+	}
+}
+
+// uv is the sole source of python. The build runs as root and the box runs as
+// `agent` over a persistent /home/agent volume that shadows the image, so an
+// interpreter under either home is unreachable; and a distro python installed
+// beside it silently answers `python3` at a version nobody asked for.
+func TestPythonIsSolelyUvManaged(t *testing.T) {
+	cfg := cfgWith(t, "")
+	cfg.Toolchains = map[string]string{"python": "3.13"}
+	df := Dockerfile(cfg, 1000, 1000)
+
+	if !strings.Contains(df, "UV_PYTHON_INSTALL_DIR=/opt/uv/python UV_PYTHON_BIN_DIR=/usr/local/bin") {
+		t.Error("the managed interpreter must be installed under /opt, not a home directory")
+	}
+	if !strings.Contains(df, "uv python install --default 3.13") {
+		t.Error("the pinned interpreter must be installed as the default python/python3")
+	}
+	if !strings.Contains(df, "ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python") {
+		t.Error("UV_PYTHON_INSTALL_DIR must persist into the image so uv resolves it at runtime")
+	}
+	// No second interpreter, and no pipx: `uv tool install` covers it.
+	for _, forbid := range []string{"install -y --no-install-recommends python3", "pipx", "PIPX_"} {
+		if strings.Contains(df, forbid) {
+			t.Errorf("python toolchain must not install %q alongside the uv interpreter", forbid)
+		}
+	}
+	// The build asserts the interpreter on PATH is the requested one.
+	if !strings.Contains(df, "python: wanted 3.13, got") {
+		t.Error("the build must fail when the python on PATH is not the requested version")
+	}
+}
+
 func TestDockerfileRequirements(t *testing.T) {
 	cfg := cfgWith(t, "")
 	cfg.Toolchains = map[string]string{"node": "24"}
