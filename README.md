@@ -1,16 +1,13 @@
 # agentbox
 
 > [!WARNING]
-> **Experimental and educational — do not use in security-sensitive environments.**
-> agentbox is a personal side project, not an audited security tool. It began
-> as an idea from a web developer (C#/TypeScript) with **no background in Go or
-> in low-level container/VM sandboxing**, and neither the code nor its security
-> reasoning has been independently reviewed. Everything below about isolation,
-> secret masking, and egress control describes *design intent under active
-> development* — **treat it as aspirational, not as a guarantee.** Do not rely
-> on agentbox to contain untrusted or malicious code, to protect real secrets,
-> or for anything where a sandbox escape would actually matter. Use it to learn
-> and experiment, at your own risk. See [docs/security.md](docs/security.md).
+> **Experimental — not audited, and not for security-sensitive environments.**
+> agentbox has not been independently reviewed, and it is under active
+> development. Everything below about isolation, secret masking, and egress
+> control describes *design intent*, not a guarantee. Do not rely on agentbox
+> to contain untrusted or malicious code, to protect real secrets, or for
+> anything where a sandbox escape would actually matter. See
+> [docs/security.md](docs/security.md) for the threat model and its limits.
 
 Run an agentic coding tool inside an isolated, per-project environment —
 declarative config, default-deny egress, host-side secret masking,
