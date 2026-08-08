@@ -122,8 +122,11 @@ guest_root        = "deny"       # "deny" only; "allow" here is a parse error
 
 # ---- security: vm tier ----
 [security.vm]
-hypervisor     = "auto"          # "auto" | "qemu" | "cloud-hypervisor" | "libkrun"
-runtime        = "auto"          # "auto" | "kata" | "krun"
+hypervisor     = "auto"          # "auto" | "qemu" | "cloud-hypervisor" | "libkrun"*
+runtime        = "auto"          # "auto" | "kata" | "krun"*
+                                 # * accepted values, then refused: libkrun cannot
+                                 #   serve this tier (crun implements no exec, so
+                                 #   nothing can enter the box) — see docs/install.md
 guest_root     = "allow"         # "allow" | "deny"
 nested_docker  = false           # safe only under this tier
 memory_backing = "balloon"       # "balloon" | "prealloc"

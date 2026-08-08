@@ -17,7 +17,7 @@ to a container or VM backend. This guide covers both.
 - [Build from source](#build-from-source)
 - [Runtime setup](#runtime-setup)
   - [Container tier](#container-tier-docker-or-rootless-podman)
-  - [VM tier](#vm-tier-kata-or-libkrun)
+  - [VM tier](#vm-tier-kata-containers)
 - [Shell completions](#shell-completions)
 - [Man pages](#man-pages)
 - [Verify the install](#verify-the-install)
@@ -31,7 +31,7 @@ to a container or VM backend. This guide covers both.
 | | Requirement |
 |---|---|
 | **OS** | Linux (`amd64` or `arm64`). agentbox targets Linux only — it drives Linux container/VM runtimes and uses Linux mount namespaces for masking. |
-| **Runtime** (one of) | Docker with Compose v2, **or** rootless Podman — for the `container` tier. Kata Containers (via docker) or libkrun (via podman) on KVM — for the `vm` tier. See [Runtime setup](#runtime-setup). |
+| **Runtime** (one of) | Docker with Compose v2, **or** rootless Podman — for the `container` tier. Kata Containers via docker, on KVM — for the `vm` tier. See [Runtime setup](#runtime-setup). |
 | **`git`** | Required for the `worktree` and `copy` tree modes, and used by `agentbox doctor` to inspect remotes. The ignore-matcher is also differentially tested against `git check-ignore`. |
 | **To build** | Go ≥ 1.22 to compile; the repo's toolchain is pinned to Go 1.26 in `go.mod`. |
 
@@ -100,21 +100,27 @@ seccomp. The container tier protects against a careless or prompt-injected
 agent and malicious install scripts, but **not** against a kernel or runtime
 escape — see [docs/security.md](security.md) for the full threat model.
 
-### VM tier (Kata or libkrun)
+### VM tier (Kata Containers)
 
 Choose this tier (`min_isolation = "vm"`) when you want a hypervisor
 boundary rather than a shared kernel. It needs:
 
 - **KVM**: `/dev/kvm` present — bare metal, or a VM with nested
   virtualization enabled. `agentbox doctor` reports whether it's there.
-- An **OCI-consuming VM runtime**:
-  - **Kata Containers** driven through Docker (runtimes `kata`,
-    `kata-qemu`, `kata-clh`), or
-  - **libkrun** driven through Podman (runtime `krun`).
+- **Kata Containers** driven through Docker (runtimes `kata`, `kata-qemu`,
+  `kata-clh`). See [libkrun is not usable](#libkrun-is-not-usable) for why
+  it is the only supported option.
 - **`CAP_SYS_ADMIN`** for agentbox itself, so it can construct the host-side
   mask view. Without it, mask mounts are expressed *inside* the guest and
   agentbox **warns** that a guest-root process could unmount them — no
   silent weakening, but a real caveat.
+
+`agentbox doctor` and `agentbox backends` list every engine/runtime pair
+found. Where a host has more than one, `runtime = "auto"` takes the first in
+preference order (`kata`, `kata-qemu`, `kata-clh`; docker before podman);
+set `[security.vm].runtime` or `.hypervisor` explicitly to pin another. A
+pinned runtime that no engine provides is an error naming what each one
+offers, never a silent fallback.
 
 Both backends consume the **same OCI image** the container tier builds; only
 the runtime differs. Under the vm tier, `mask_mode = "auto"` resolves to the
@@ -141,8 +147,8 @@ the setuid `fusermount3` helper. For that route:
   while the runtime's virtiofs server may run as another — a root Docker
   daemon's does — and without `allow_other` the kernel refuses it access to
   the share. agentbox requires the option even where the virtiofs server
-  happens to share your uid (rootless Podman with libkrun), because the
-  alternative is a box that starts and then fails opaquely.
+  happens to share your uid, because the alternative is a box that starts and
+  then fails opaquely.
 
 `agentbox doctor` reports which route is available and which way `auto`
 resolves. Note that the **host-side `view`** (Layer 0/2 mounts) still needs
@@ -151,10 +157,35 @@ using `view` expresses mask mounts in the guest and warns. Under the vm tier
 the rootless path is therefore `filter`, which is also the stronger mode.
 
 Follow the upstream install docs for
-[Kata Containers](https://katacontainers.io/) or
-[libkrun](https://github.com/containers/libkrun); then confirm with
+[Kata Containers](https://katacontainers.io/); then confirm with
 `agentbox doctor`, which lists each backend, its tier, and whether it's
 available.
+
+#### libkrun is not usable
+
+[libkrun](https://github.com/containers/libkrun), driven through Podman as
+the `krun` OCI runtime, looks like a natural second option for this tier and
+is **not** one. Every agentbox operation on a box is an engine `exec`: the
+box is created running `sleep infinity`, and `up`, `run` and `shell` all
+enter it. crun's libkrun handler implements no `exec` callback — libkrun
+boots a microVM whose init *is* the entrypoint, with no in-guest agent to
+spawn further processes — so a box created under `krun` starts and then
+refuses every command with "the handler does not support exec"
+([containers/crun#2090](https://github.com/containers/crun/issues/2090)).
+Kata works because `kata-agent` and its shim implement exec over vsock.
+
+What agentbox does about it:
+
+- `krun` is never selected by `auto`, on either engine. If the binary is
+  installed, `agentbox doctor` names it and explains why it is not a
+  candidate, rather than reporting that no VM runtime was found.
+- `runtime = "krun"` or `hypervisor = "libkrun"` is a configuration error
+  (exit 78) naming the exec limitation and pointing here. The values remain
+  valid schema so that this is the message you get.
+- If krun is the only VM runtime on the host, the `vm` tier is unavailable
+  and `min_isolation = "vm"` exits 69. Install Kata, or lower the floor
+  deliberately with `--force-isolation container` — which is recorded in the
+  box's metadata and warned about on every invocation.
 
 ## Shell completions
 

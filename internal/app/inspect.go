@@ -331,7 +331,7 @@ func (c *Ctx) CmdBackends() error {
 	}
 	for _, av := range avs {
 		if av.Available {
-			fmt.Printf("%-10s tier=%-10s available (runtime: %s)\n", av.Name, av.Tier, av.Runtime)
+			fmt.Printf("%-10s tier=%-10s available (runtime: %s)\n", av.Name, av.Tier, strings.Join(av.VMRuntimes(), ", "))
 		} else {
 			fmt.Printf("%-10s tier=%-10s UNAVAILABLE: %s\n", av.Name, av.Tier, av.Reason)
 		}
@@ -367,7 +367,7 @@ func (c *Ctx) CmdDoctor() error {
 
 	for _, av := range c.Availabilities() {
 		if av.Available {
-			report(true, "backend %s (tier %s): available via %s", av.Name, av.Tier, av.Runtime)
+			report(true, "backend %s (tier %s): available via %s", av.Name, av.Tier, strings.Join(av.VMRuntimes(), ", "))
 		} else {
 			report(av.Name == "vm", "backend %s (tier %s): %s", av.Name, av.Tier, av.Reason)
 		}

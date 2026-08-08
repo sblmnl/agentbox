@@ -62,8 +62,9 @@ in.
 | Requires KVM / nested virt | No | Yes |
 
 > **Implementation status:** this release implements both tiers. The `vm`
-> tier runs on an OCI-consuming VM runtime — Kata Containers (docker) or
-> libkrun (podman) — and requires `/dev/kvm`; where the runtime or KVM is
+> tier runs on an OCI-consuming VM runtime — Kata Containers, via docker;
+> libkrun is [not usable](install.md#libkrun-is-not-usable) because nothing
+> can enter a box it created — and requires `/dev/kvm`; where the runtime or KVM is
 > missing, `min_isolation = "vm"` exits 69 naming what would fix it. The
 > Layer 3 filtered share (`mask_mode = "filter"`) ships in this release:
 > under `vm`, `auto` resolves to `filter` where the seam is deliverable

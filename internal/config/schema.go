@@ -98,6 +98,11 @@ var schema = map[string]keySpec{
 	// only accepted value.
 	"security.container.guest_root": {kind: kString, enum: []string{"deny"}},
 
+	// "krun"/"libkrun" stay in these enums on purpose, though the vm tier
+	// refuses them: parsing the value is what lets backend.ResolveVMRuntime
+	// answer with the specific reason (crun implements no exec —
+	// containers/crun#2090) instead of a generic unknown-value error that
+	// explains nothing. Do not "tidy" them out.
 	"security.vm.hypervisor":     {kind: kString, enum: []string{"auto", "qemu", "cloud-hypervisor", "libkrun"}},
 	"security.vm.runtime":        {kind: kString, enum: []string{"auto", "kata", "krun"}},
 	"security.vm.guest_root":     {kind: kString, enum: []string{"allow", "deny"}},

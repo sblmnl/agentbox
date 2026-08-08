@@ -19,6 +19,49 @@ version. This section becomes `0.0.1` at the first tagged release.
 
 ### Fixed
 
+- **The `vm` tier no longer offers libkrun (`krun`), and says why.** Every
+  agentbox operation on a box is an engine `exec` — the box runs
+  `sleep infinity` and `up`, `run` and `shell` all enter it — and crun's
+  libkrun handler implements no exec callback: libkrun boots a microVM whose
+  init *is* the entrypoint, with no in-guest agent to spawn anything further
+  (containers/crun#2090). A box created under `krun` therefore came up and
+  could never be entered, failing with "the handler does not support exec".
+  This is a property of the runtime at every current version, not of any one
+  host, so:
+  - `krun` is no longer a probe candidate, and `auto` cannot select it, on
+    either engine. Where the binary is installed, `doctor` and `backends`
+    name it and explain the refusal rather than reporting no VM runtime.
+  - `runtime = "krun"` / `hypervisor = "libkrun"` is refused by name (exit
+    78) pointing at Kata, instead of the generic "not configured on this
+    host" message that sent users off to install what could not help. Both
+    values stay valid schema so the specific message is what they draw.
+  - On a host whose only VM runtime is krun the tier is unavailable, so
+    `min_isolation = "vm"` exits 69 naming it; `--force-isolation container`
+    remains the documented, warned-about escape hatch.
+
+  **Kata via docker is now the only supported vm-tier runtime.** Existing
+  boxes created on podman/krun cannot be entered either; `--recreate`
+  rebuilds one on an available backend, keeping its persistent home.
+
+  Runtime probing also no longer stops at the first engine that has one: it
+  records every engine/runtime pair, `[security.vm].runtime` may name any of
+  them, and a request nothing satisfies is refused with what each engine
+  offers. `auto` still takes the first pair in preference order.
+- **A guest that dies at boot is now named at `start`.** Under the `vm` tier
+  `start` exiting 0 proves only that the engine launched the runtime; a
+  hypervisor that aborts while bringing the guest up does so a moment later
+  and out of band. The failure surfaced as the *next* command not being able
+  to enter the box, with the real panic sitting unread in the engine's log.
+  `start` now confirms the box is still running and, when it is not, fails
+  naming the exit code with the tail of the guest log.
+- **The `vm` egress probe no longer fails open when it cannot run.** The
+  check that catches a box whose egress path is silently broken treated any
+  failure to run as "no evidence" and passed. A missing `curl` in a
+  user-supplied image genuinely is no evidence and stays silent, but an
+  engine that could not run the probe at all — a box that died, an engine
+  error, a runtime that cannot exec — left the check unable to run, which was
+  reported as success. That case now warns on every invocation, naming the
+  box and the engine's own error.
 - **Bundle `agent:claude-code` gains `platform.claude.com`.** Claude Code
   contacts `platform.claude.com` to authenticate before it makes its first
   API call, so a box built on the stock bundle failed at startup with

@@ -1,6 +1,6 @@
 // Package vmconformance is the VM conformance suite. It drives the
 // real CLI against a real OCI VM runtime, so it needs KVM, an engine with a
-// kata/krun runtime configured, and root (the host-side mask view needs
+// Kata runtime configured, and root (the host-side mask view needs
 // CAP_SYS_ADMIN). It is gated on AGENTBOX_VM_CONFORMANCE=1 and skips
 // visibly otherwise; the CI job FAILS when this suite skips —
 // a green build that silently omitted it is the failure mode these tests
@@ -52,7 +52,7 @@ func TestMain(m *testing.M) {
 func gate(t *testing.T) {
 	t.Helper()
 	if os.Getenv("AGENTBOX_VM_CONFORMANCE") != "1" {
-		t.Skip("vm conformance requires AGENTBOX_VM_CONFORMANCE=1 (KVM + kata/krun + root); CI must fail on this skip")
+		t.Skip("vm conformance requires AGENTBOX_VM_CONFORMANCE=1 (KVM + kata + root); CI must fail on this skip")
 	}
 	out, _, code := agentbox(t, t.TempDir(), "backends", "--json")
 	if code != 0 {

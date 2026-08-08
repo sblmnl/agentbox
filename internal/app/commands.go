@@ -534,7 +534,7 @@ func (c *Ctx) CmdBuild(noCache bool) error {
 	for _, av := range avs {
 		if av.Available && av.Name == "vm" {
 			vmCfg := c.Cfg.Config.Security.VM
-			engine, runtime, err := backend.ResolveVMRuntime(av.Runtime, vmCfg.Runtime, vmCfg.Hypervisor)
+			engine, runtime, err := backend.ResolveVMRuntime(av.VMRuntimes(), vmCfg.Runtime, vmCfg.Hypervisor)
 			if err != nil {
 				return Configf("%v", err)
 			}
@@ -727,7 +727,7 @@ func (c *Ctx) CmdVersion() error {
 		if !av.Available {
 			status = "unavailable"
 		}
-		fmt.Printf("backend %s (tier %s): %s %s\n", av.Name, av.Tier, status, av.Runtime)
+		fmt.Printf("backend %s (tier %s): %s %s\n", av.Name, av.Tier, status, strings.Join(av.VMRuntimes(), ", "))
 	}
 	return nil
 }

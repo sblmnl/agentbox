@@ -141,9 +141,9 @@ invalidates trust).
 ## Security model, honestly
 
 Two isolation tiers exist behind one contract: `container` (Docker or
-rootless Podman) and `vm` (Kata Containers via docker, or libkrun via
-podman, on KVM). They are **not equivalent**, and agentbox is built around
-never letting that difference hide:
+rootless Podman) and `vm` (Kata Containers via docker, on KVM). They are
+**not equivalent**, and agentbox is built around never letting that
+difference hide:
 
 - A project declares the weakest tier it accepts (`min_isolation`); if no
   available backend meets it, agentbox exits 69 naming what is missing.
@@ -193,7 +193,7 @@ in [docs/versioning.md](docs/versioning.md).
 | Bulk teardown: `prune --boxes/--running/--state`, branches never deleted | ✅ |
 | Workspace-config trust (TOFU for `[hooks]` / mounts) | ✅ |
 | Man pages, shell completions (bash/zsh/fish) | ✅ |
-| VM backend: Kata (docker) / libkrun (podman), per-box selection, host proxy daemon reached over vsock, host-side mask view | ✅ |
+| VM backend: Kata (docker), per-box selection, host proxy daemon reached over vsock, host-side mask view | ✅ |
 | Layer-3 lookup-time filtering (`mask_mode = "filter"`, own share daemon) | ✅ |
 | Proxy credential injection | 🚧 planned |
 
@@ -218,8 +218,18 @@ Deviations, honestly stated:
 - The `vm` tier's host-side mask view needs agentbox to run with
   CAP_SYS_ADMIN; without it, mask mounts are expressed in the guest and
   agentbox warns that a guest root process could unmount them.
-- VM conformance tests need KVM plus a kata/krun runtime and run as a
-  separate CI job that fails if the suite skips; they are not part of
+- `[security.vm]` still accepts `runtime = "krun"` and
+  `hypervisor = "libkrun"` as valid configuration, and then refuses to run
+  on them (exit 78). libkrun cannot serve this tier: crun's libkrun handler
+  implements no `exec` callback, so a box created under it comes up and no
+  agentbox command can enter it (containers/crun#2090). Dropping the values
+  from the schema would be tidier but would answer with a generic
+  unknown-value error; keeping them parseable is what lets the refusal name
+  the reason and point at Kata. `krun` is likewise excluded from `auto`
+  selection on both engines, and an installed krun is named as unusable by
+  `doctor` rather than passed over in silence.
+- VM conformance tests need KVM plus a Kata runtime and run as a separate
+  CI job that fails if the suite skips; they are not part of
   `go test ./...` on an ordinary host.
 - `agentbox allow` rewrites the workspace TOML structurally and does not
   preserve comments (it says so when it runs).

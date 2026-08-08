@@ -282,14 +282,20 @@ func (c *Ctx) activeBackend(meta *state.BoxMeta) (backend.Backend, error) {
 	for _, av := range c.Availabilities() {
 		if av.Name == meta.Backend {
 			if !av.Available {
-				return nil, Unavailablef("box %s was created on backend %q, which is unavailable here: %s", meta.Instance, meta.Backend, av.Reason)
+				// A box can also outlive its backend because the backend
+				// stopped being offered, not because the host changed — a box
+				// created on podman/krun before that runtime was refused is
+				// the case in hand — so say what recovers it.
+				return nil, Unavailablef("box %s was created on backend %q, which is unavailable here: %s\n"+
+					"Restore that backend, or rebuild the box on one that is available here with `--recreate` (the box's persistent home is kept).",
+					meta.Instance, meta.Backend, av.Reason)
 			}
 			switch av.Name {
 			case "container":
 				return backend.NewContainerBackend(av.Runtime), nil
 			case "vm":
 				vmCfg := c.Cfg.Config.Security.VM
-				engine, runtime, err := backend.ResolveVMRuntime(av.Runtime, vmCfg.Runtime, vmCfg.Hypervisor)
+				engine, runtime, err := backend.ResolveVMRuntime(av.VMRuntimes(), vmCfg.Runtime, vmCfg.Hypervisor)
 				if err != nil {
 					return nil, Configf("%v", err)
 				}

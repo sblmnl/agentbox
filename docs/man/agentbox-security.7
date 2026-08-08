@@ -61,8 +61,10 @@ Requires KVM / nested virt|No|Yes
 .TE
 .PP
 The current release implements both tiers. The vm tier runs on an
-OCI-consuming VM runtime \(em Kata Containers (docker) or libkrun (podman)
-\(em and requires /dev/kvm. Where hardware or runtime is missing, a project
+OCI-consuming VM runtime \(em Kata Containers, via docker \(em and requires
+/dev/kvm. libkrun is not usable: crun's libkrun handler implements no exec
+callback, so nothing can enter a box it created, and agentbox refuses it by
+name. Where hardware or runtime is missing, a project
 declaring
 .B min_isolation = \[dq]vm\[dq]
 exits 69 naming what would fix it rather than silently substituting the

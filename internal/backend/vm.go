@@ -3,6 +3,7 @@ package backend
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -17,14 +18,17 @@ import (
 	"github.com/sblmnl/agentbox/internal/share"
 )
 
-// VMBackend provides the vm tier on an OCI-consuming VM runtime —
-// Kata Containers or libkrun — driven through a container engine CLI. The
-// image pipeline, the configuration model, and the mask generator are
-// exactly the ones the container backend uses; what changes is the runtime
-// handed to the engine, the share construction, and the proxy topology.
+// VMBackend provides the vm tier on an OCI-consuming VM runtime — Kata
+// Containers — driven through a container engine CLI. The image pipeline, the
+// configuration model, and the mask generator are exactly the ones the
+// container backend uses; what changes is the runtime handed to the engine,
+// the share construction, and the proxy topology.
+//
+// Nothing here is Kata-specific by design; krun is refused a tier up, at
+// selection (see krunRefusal), because it cannot be entered at all.
 type VMBackend struct {
 	EngineBin string // "docker" or "podman"
-	VMRuntime string // engine runtime name: "kata", "kata-qemu", "kata-clh", "krun"
+	VMRuntime string // engine runtime name: "kata", "kata-qemu", "kata-clh"
 	StateRoot string // agentbox state root: proxyd spool and share views live here
 	SelfExe   string // binary spawned as the proxyd daemon (normally os.Executable)
 
@@ -321,14 +325,9 @@ func (v *VMBackend) Create(spec *BoxSpec) error {
 		"--workdir", spec.Workdir,
 	}
 
-	if spec.MemoryBacking == "prealloc" && v.VMRuntime != "krun" {
-		// Kata annotation; balloon (the default) needs nothing. libkrun has
-		// no preallocation knob — the schema accepted the key, so say why
-		// it does nothing rather than dropping it silently.
+	if spec.MemoryBacking == "prealloc" {
+		// Kata annotation; balloon (the default) needs nothing.
 		args = append(args, "--annotation", "io.katacontainers.config.hypervisor.enable_mem_prealloc=true")
-	}
-	if spec.MemoryBacking == "prealloc" && v.VMRuntime == "krun" {
-		v.Warnf("security.vm.memory_backing = \"prealloc\" has no effect under the krun runtime; the guest uses ballooned memory")
 	}
 	if spec.NestedDocker {
 		// a nested container engine is permitted at this tier because
@@ -425,10 +424,46 @@ func (v *VMBackend) Start(spec *BoxSpec) error {
 	if err := v.run("start", spec.ResourceName); err != nil {
 		return err
 	}
+	if err := v.confirmRunning(spec); err != nil {
+		return err
+	}
 	if spec.Policy != nil && spec.Policy.Mode == netpol.ModeProxy {
 		return v.probeProxyReach(spec)
 	}
 	return nil
+}
+
+// confirmRunning checks that the guest is still up after `start` returned.
+//
+// Under this tier `start` exiting 0 proves only that the engine launched the
+// runtime; a hypervisor that aborts while bringing the guest up — no KVM
+// permission, an unsupported machine type, a rootfs the runtime cannot
+// convert — does so a moment later and out of band. What the user sees then
+// is the *next* command failing to enter a box the engine describes as
+// exited, with the actual panic sitting unread in the engine's log. Reading
+// the log here turns that into one named error at start.
+func (v *VMBackend) confirmRunning(spec *BoxSpec) error {
+	st, err := v.Inspect(spec.ResourceName)
+	if err != nil {
+		return fmt.Errorf("box %s: `start` reported success but the box cannot be inspected: %w", spec.ResourceName, err)
+	}
+	if st.Running {
+		return nil
+	}
+	msg := fmt.Sprintf("box %s exited immediately after starting (status %q, exit code %d)",
+		spec.ResourceName, st.Status, st.ExitCode)
+	if tail := v.logTail(spec.ResourceName); tail != "" {
+		msg += "\n\nlast lines of the guest log:\n" + tail
+	}
+	return fmt.Errorf("%s\n\nThe VM runtime launched but the guest did not stay up. `%s logs %s` has the\nfull output; a hypervisor that cannot open /dev/kvm and a rootfs the runtime\ncannot convert both fail this way.",
+		msg, v.EngineBin, spec.ResourceName)
+}
+
+// logTail returns the last few lines of a box's engine log, best-effort: it is
+// diagnostic detail attached to an error that stands without it.
+func (v *VMBackend) logTail(name string) string {
+	out, _ := v.Runner("logs", "--tail", "20", name).CombinedOutput()
+	return strings.TrimSpace(string(out))
 }
 
 // probeProxyReach checks, from inside the started guest, that the box can
@@ -445,7 +480,12 @@ func (v *VMBackend) Start(spec *BoxSpec) error {
 //
 // A probe that cannot run (no curl in a user-supplied image) is not evidence
 // of a broken path and must not fail the box; only an actual connect failure
-// is treated as one.
+// is treated as one. That exemption is deliberately narrow: it covers a
+// missing tool *inside* a guest the engine did enter, and nothing else. An
+// engine that cannot run the probe at all — a box that died, an engine error,
+// a runtime whose exec is not implemented — leaves the check that exists to
+// catch silently-broken egress unable to run, and passing that off as success
+// would be a fail-open. It warns on every invocation instead.
 func (v *VMBackend) probeProxyReach(spec *BoxSpec) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", netpol.VsockPort)
 	// The box has only just started; give its forwarder a moment to bind
@@ -459,7 +499,14 @@ func (v *VMBackend) probeProxyReach(spec *BoxSpec) error {
 				"curl -s -o /dev/null -m 5 --noproxy '*' http://"+addr+"/; echo $?")
 		out, err := cmd.Output()
 		if err != nil {
-			return nil // probe could not run; not evidence of a broken path
+			var ee *exec.ExitError
+			if errors.As(err, &ee) && ee.ExitCode() == 127 {
+				// The guest ran the script and it found no curl: the probe
+				// could not run, which is not evidence of a broken path.
+				return nil
+			}
+			v.probeUnrunnableWarning(spec, err)
+			return nil
 		}
 		code = strings.TrimSpace(string(out))
 		if code != "7" || time.Now().After(deadline) {
@@ -487,6 +534,29 @@ func (v *VMBackend) probeProxyReach(spec *BoxSpec) error {
 			spec.ResourceName, addr, netpol.LogPath(v.StateRoot))
 	}
 	return nil
+}
+
+// probeUnrunnableWarning reports that the egress path could not be verified.
+//
+// It is a warning rather than an error because the box may well be fine and
+// the probe is itself diagnostic: failing the box closed here would let a
+// transient engine hiccup take down work that would otherwise have run. What
+// it must not do is stay quiet — an unverified egress path is exactly the
+// condition the probe exists to surface.
+func (v *VMBackend) probeUnrunnableWarning(spec *BoxSpec, err error) {
+	detail := err.Error()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		if msg := strings.TrimSpace(string(ee.Stderr)); msg != "" {
+			detail = msg
+		}
+	}
+	v.Warnf("box %s: could not verify that the box can reach its egress proxy — the engine\n"+
+		"could not run the probe in it. Egress policy is enforced by the host daemon, so\n"+
+		"this is not a widened policy; what is unverified is whether the box has any\n"+
+		"working egress at all, and a broken forwarder makes every network call inside\n"+
+		"the box hang. `agentbox logs` shows the forwarder's errors.\n"+
+		"engine: %s", spec.ResourceName, detail)
 }
 
 func (v *VMBackend) ensureProxyListener(spec *BoxSpec) error {

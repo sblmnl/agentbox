@@ -241,8 +241,10 @@ min_isolation = "vm"
 mask_mode     = "auto"            # under vm: "filter" (lookup-time, dynamic) where agentbox runs as root
 
 [security.vm]
-runtime        = "auto"           # "auto" | "kata" | "krun"
-hypervisor     = "auto"           # "auto" | "qemu" | "cloud-hypervisor" | "libkrun"
+runtime        = "auto"           # "auto" | "kata" | "krun"*
+hypervisor     = "auto"           # "auto" | "qemu" | "cloud-hypervisor" | "libkrun"*
+                                  # * parse, then refuse: libkrun cannot serve this
+                                  #   tier — nothing can exec into the box it creates
 guest_root     = "deny"           # tighten: no root inside the guest
 nested_docker  = false
 memory_backing = "balloon"

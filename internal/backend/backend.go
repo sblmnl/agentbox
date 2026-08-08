@@ -109,11 +109,14 @@ type Backend interface {
 	Logs(name string, proxy bool, follow bool) error
 }
 
-// State is a backend-reported box runtime state.
+// State is a backend-reported box runtime state. ExitCode is meaningful only
+// once the box has stopped: a guest that aborts at boot leaves it as the only
+// evidence the engine kept of why.
 type State struct {
-	Running bool
-	Pid     int
-	Status  string
+	Running  bool
+	Pid      int
+	Status   string
+	ExitCode int
 }
 
 // Availability is one probed backend: availability is probed,
@@ -124,6 +127,23 @@ type Availability struct {
 	Available bool   `json:"available"`
 	Reason    string `json:"reason,omitempty"` // why unavailable, and what would fix it
 	Runtime   string `json:"runtime,omitempty"`
+	// Runtimes lists every engine/runtime pair probed for this backend, in
+	// preference order (vm tier only; Runtime is the first). A host can have
+	// more than one, and [security.vm] may name any of them, so all of them
+	// must survive the probe rather than only the preferred one.
+	Runtimes []string `json:"runtimes,omitempty"`
+}
+
+// VMRuntimes returns the probed engine/runtime candidates, tolerating an
+// Availability that carries only the single preferred Runtime.
+func (a Availability) VMRuntimes() []string {
+	if len(a.Runtimes) > 0 {
+		return a.Runtimes
+	}
+	if a.Runtime == "" {
+		return nil
+	}
+	return []string{a.Runtime}
 }
 
 // Probe enumerates backends and their availability on this host.
@@ -163,59 +183,112 @@ func probeVM() Availability {
 	if fi, err := os.Stat("/dev/kvm"); err == nil && fi.Mode()&os.ModeDevice != 0 {
 		kvm = true
 	}
-	engine, runtime, detail := detectVMRuntime()
+	candidates, detail := detectVMRuntimes()
 	switch {
-	case !kvm && runtime == "":
+	case !kvm && len(candidates) == 0:
 		av.Reason = "no /dev/kvm (hypervisor isolation requires KVM on bare metal or nested virtualization) and no OCI VM runtime (" + detail + ")"
 	case !kvm:
 		av.Reason = "no /dev/kvm: hypervisor isolation requires KVM on bare metal or nested virtualization"
-	case runtime == "":
+	case len(candidates) == 0:
 		av.Reason = "KVM is available but no OCI-consuming VM runtime is usable: " + detail
 	default:
 		av.Available = true
-		av.Runtime = engine + "/" + runtime
+		av.Runtimes = candidates
+		av.Runtime = candidates[0]
 	}
 	return av
 }
 
 // vmRuntimePreference orders engine runtime names worth selecting.
-// Firecracker (kata-fc) is deliberately absent: it lacks virtiofs, which
-// the share layer hard-requires (Appendix B).
-var vmRuntimePreference = []string{"kata", "kata-qemu", "kata-clh", "krun"}
+//
+// Two runtimes are deliberately absent, for the same category of reason — the
+// runtime cannot deliver something this tier is built on:
+//   - Firecracker (kata-fc) lacks virtiofs, which the share layer hard-requires
+//     (Appendix B).
+//   - krun (libkrun) cannot be entered: see krunRefusal.
+var vmRuntimePreference = []string{"kata", "kata-qemu", "kata-clh"}
 
-// detectVMRuntime finds an engine able to drive an OCI VM runtime.
-// Availability is probed, never assumed.
-func detectVMRuntime() (engine, runtime, detail string) {
+// krunRefusal explains why the krun runtime cannot serve the vm tier.
+//
+// Every agentbox operation on a box is an engine `exec`: the box is created
+// running `sleep infinity` and `up`, `run` and `shell` all enter it. crun's
+// libkrun handler implements no exec callback — libkrun boots a microVM whose
+// init *is* the entrypoint, and there is no in-guest agent to spawn further
+// processes — so the failure is not one command but the whole tier. Kata
+// works because kata-agent and its shim implement exec over vsock.
+//
+// This is a property of the runtime at every current version, not of this
+// host, so it is a static refusal rather than a probe result.
+const krunRefusal = "the krun runtime (libkrun) cannot serve the vm tier: crun's libkrun handler " +
+	"implements no exec callback, so no agentbox command can enter the box " +
+	"(containers/crun#2090); use Kata via docker instead"
+
+// Test seams over the host. detectVMRuntimes is otherwise a pure function of
+// what happens to be installed on the machine running the tests, which is not
+// something a unit test can arrange.
+var (
+	lookPath = exec.LookPath
+
+	// engineRuntimeNames lists an engine's configured runtime names.
+	engineRuntimeNames = func(engineBin string) ([]string, error) {
+		out, err := engineOutput(func(args ...string) *exec.Cmd { return exec.Command(engineBin, args...) },
+			"info", "--format", "{{range $k, $v := .Runtimes}}{{$k}} {{end}}")
+		if err != nil {
+			return nil, err
+		}
+		return strings.Fields(out), nil
+	}
+
+	// engineReachable reports whether an engine answers at all.
+	engineReachable = func(engineBin string) bool {
+		return exec.Command(engineBin, "info").Run() == nil
+	}
+)
+
+// detectVMRuntimes enumerates every engine able to drive an OCI VM runtime,
+// in preference order. Availability is probed, never assumed — and probing
+// does not stop at the first hit: a host with a VM runtime under each engine
+// must offer both, or [security.vm].runtime could never name the second.
+//
+// A runtime that is installed but unusable contributes a detail saying so
+// rather than going quiet, because `doctor` and `backends` are where the user
+// looks to find out why the tier is unavailable.
+func detectVMRuntimes() (candidates []string, detail string) {
 	details := []string{}
-	if p, err := exec.LookPath("docker"); err == nil {
-		if out, err := engineOutput(func(args ...string) *exec.Cmd { return exec.Command(p, args...) },
-			"info", "--format", "{{range $k, $v := .Runtimes}}{{$k}} {{end}}"); err == nil {
-			if name := pickVMRuntime(strings.Fields(out)); name != "" {
-				return "docker", name, ""
+	if p, err := lookPath("docker"); err == nil {
+		if names, err := engineRuntimeNames(p); err == nil {
+			if name := pickVMRuntime(names); name != "" {
+				candidates = append(candidates, "docker/"+name)
+			} else {
+				details = append(details, "docker: no kata runtime configured in the daemon (add one under \"runtimes\" in daemon.json)")
 			}
-			details = append(details, "docker: no kata or krun runtime configured in the daemon (add one under \"runtimes\" in daemon.json)")
 		} else {
 			details = append(details, "docker: daemon not reachable")
 		}
 	} else {
 		details = append(details, "docker: not installed")
 	}
-	if p, err := exec.LookPath("podman"); err == nil {
-		if exec.Command(p, "info").Run() == nil {
+	if p, err := lookPath("podman"); err == nil {
+		if engineReachable(p) {
 			// podman drives libkrun through the krun OCI runtime binary;
 			// Kata's shim-v2 architecture is containerd-shaped and is not
-			// probed here.
-			if _, err := exec.LookPath("krun"); err == nil {
-				return "podman", "krun", ""
+			// probed here. krun is found and then declined — a candidate
+			// nothing could enter is worse than no candidate.
+			if _, err := lookPath("krun"); err == nil {
+				details = append(details, "podman: krun found but unusable — "+krunRefusal)
+			} else {
+				details = append(details, "podman: no krun binary on PATH, and krun could not serve this tier anyway — "+krunRefusal)
 			}
-			details = append(details, "podman: no krun binary on PATH (install libkrun/crun-krun)")
 		} else {
 			details = append(details, "podman: `podman info` failed")
 		}
 	} else {
 		details = append(details, "podman: not installed")
 	}
-	return "", "", strings.Join(details, "; ")
+	if len(candidates) > 0 {
+		return candidates, ""
+	}
+	return nil, strings.Join(details, "; ")
 }
 
 func pickVMRuntime(configured []string) string {
@@ -237,35 +310,48 @@ var listEngineRuntimes = func(engineBin string) []string {
 	if engineBin != "docker" {
 		return nil
 	}
-	out, err := engineOutput(func(args ...string) *exec.Cmd { return exec.Command(engineBin, args...) },
-		"info", "--format", "{{range $k, $v := .Runtimes}}{{$k}} {{end}}")
+	names, err := engineRuntimeNames(engineBin)
 	if err != nil {
 		return nil
 	}
-	return strings.Fields(out)
+	return names
 }
 
-// ResolveVMRuntime maps [security.vm].runtime and .hypervisor onto the
-// engine runtime recorded at probe time. A requested combination that is
-// not configured on this host is an error naming what is missing — never a
-// silent substitute.
-func ResolveVMRuntime(probed string, wantRuntime, wantHypervisor string) (engineBin, runtimeName string, err error) {
-	i := strings.IndexByte(probed, '/')
-	if i <= 0 {
-		return "", "", fmt.Errorf("malformed vm runtime record %q", probed)
+// ResolveVMRuntime maps [security.vm].runtime and .hypervisor onto an engine
+// runtime recorded at probe time. Every probed engine is considered, so a
+// request naming a runtime the *second* engine provides still resolves. A
+// requested combination that is configured on no engine is an error naming
+// what is missing — never a silent substitute.
+//
+// A request for krun is refused by name before any of that. The generic
+// "not configured on this host" message would otherwise send the user off to
+// install a runtime that cannot work here whatever they do to the host.
+func ResolveVMRuntime(probed []string, wantRuntime, wantHypervisor string) (engineBin, runtimeName string, err error) {
+	if wantRuntime == "krun" || wantHypervisor == "libkrun" {
+		if wantRuntime == "kata" {
+			return "", "", fmt.Errorf("security.vm: runtime \"kata\" cannot use hypervisor \"libkrun\"")
+		}
+		return "", "", fmt.Errorf("security.vm: %s (set runtime = \"kata\", or drop the key for \"auto\")", krunRefusal)
 	}
-	engineBin, detected := probed[:i], probed[i+1:]
+	type candidate struct {
+		engine   string
+		detected string
+	}
+	var candidates []candidate
+	for _, p := range probed {
+		if i := strings.IndexByte(p, '/'); i > 0 && i < len(p)-1 {
+			candidates = append(candidates, candidate{p[:i], p[i+1:]})
+		}
+	}
+	if len(candidates) == 0 {
+		return "", "", fmt.Errorf("malformed vm runtime record %q", strings.Join(probed, ", "))
+	}
 	if (wantRuntime == "" || wantRuntime == "auto") && (wantHypervisor == "" || wantHypervisor == "auto") {
-		return engineBin, detected, nil
+		return candidates[0].engine, candidates[0].detected, nil
 	}
 
 	var acceptable []string
 	switch {
-	case wantRuntime == "krun" || wantHypervisor == "libkrun":
-		if wantRuntime == "kata" {
-			return "", "", fmt.Errorf("security.vm: runtime \"kata\" cannot use hypervisor \"libkrun\"")
-		}
-		acceptable = []string{"krun"}
 	case wantHypervisor == "qemu":
 		acceptable = []string{"kata-qemu", "kata"}
 	case wantHypervisor == "cloud-hypervisor":
@@ -274,22 +360,28 @@ func ResolveVMRuntime(probed string, wantRuntime, wantHypervisor string) (engine
 		acceptable = []string{"kata", "kata-qemu", "kata-clh"}
 	}
 
-	configured := listEngineRuntimes(engineBin)
-	if len(configured) == 0 {
-		configured = []string{detected}
-	}
-	have := map[string]bool{}
-	for _, name := range configured {
-		have[name] = true
-	}
-	for _, name := range acceptable {
-		if have[name] {
-			return engineBin, name, nil
+	var found []string
+	for _, c := range candidates {
+		// The probe records one preferred runtime per engine; engines with a
+		// runtime registry are re-queried so a non-preferred one can be named.
+		configured := listEngineRuntimes(c.engine)
+		if len(configured) == 0 {
+			configured = []string{c.detected}
+		}
+		have := map[string]bool{}
+		for _, name := range configured {
+			have[name] = true
+			found = append(found, c.engine+"/"+name)
+		}
+		for _, name := range acceptable {
+			if have[name] {
+				return c.engine, name, nil
+			}
 		}
 	}
 	return "", "", fmt.Errorf(
 		"security.vm requests runtime %q / hypervisor %q, but none of the matching engine runtimes (%s) are configured on this host (found: %s)",
-		orAuto(wantRuntime), orAuto(wantHypervisor), strings.Join(acceptable, ", "), strings.Join(configured, ", "))
+		orAuto(wantRuntime), orAuto(wantHypervisor), strings.Join(acceptable, ", "), strings.Join(found, ", "))
 }
 
 func orAuto(s string) string {

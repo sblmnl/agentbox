@@ -138,8 +138,8 @@ seccomp           = "default"
 guest_root        = "deny"       # "deny" only; "allow" is a parse error here
 
 [security.vm]
-hypervisor     = "auto"
-runtime        = "auto"
+hypervisor     = "auto"          # "libkrun" parses, then is refused
+runtime        = "auto"          # "krun" parses, then is refused
 guest_root     = "allow"         # "allow" | "deny"
 nested_docker  = false           # safe only under this tier
 memory_backing = "balloon"
@@ -265,6 +265,21 @@ is a parse error everywhere. Similarly
 exists only under vm, and
 .B cap_drop
 only under container.
+.TP
+.B security.vm.runtime, security.vm.hypervisor
+.B \[dq]krun\[dq]
+and
+.B \[dq]libkrun\[dq]
+are valid values that are then refused with exit 78. libkrun cannot serve
+this tier: crun's libkrun handler implements no exec callback, so a box
+created under it starts and no agentbox command can enter it
+(containers/crun#2090). They stay valid schema so the error names that
+reason instead of reporting an unknown value; krun is also never selected
+by
+.BR \[dq]auto\[dq] ,
+and an installed krun is reported as unusable by
+.BR "agentbox doctor" .
+Kata via docker is the supported runtime.
 .TP
 .B resources.pids
 Neutral, but enforced differently: the container backend enforces it in the

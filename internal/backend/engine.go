@@ -87,16 +87,23 @@ func engineExec(runner func(args ...string) *exec.Cmd, name string, es ExecSpec)
 
 // engineInspect reads a guest's runtime state.
 func engineInspect(runner func(args ...string) *exec.Cmd, bin, name string) (State, error) {
-	out, err := engineOutput(runner, "inspect", "--format", "{{.State.Running}} {{.State.Pid}} {{.State.Status}}", name)
+	out, err := engineOutput(runner, "inspect", "--format", "{{.State.Running}} {{.State.Pid}} {{.State.Status}} {{.State.ExitCode}}", name)
 	if err != nil {
 		return State{}, fmt.Errorf("box %q does not exist in the %s runtime", name, bin)
 	}
 	parts := strings.Fields(out)
 	st := State{}
-	if len(parts) == 3 {
+	if len(parts) > 0 {
 		st.Running = parts[0] == "true"
+	}
+	if len(parts) > 1 {
 		st.Pid, _ = strconv.Atoi(parts[1])
+	}
+	if len(parts) > 2 {
 		st.Status = parts[2]
+	}
+	if len(parts) > 3 {
+		st.ExitCode, _ = strconv.Atoi(parts[3])
 	}
 	return st, nil
 }

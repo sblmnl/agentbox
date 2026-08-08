@@ -60,9 +60,8 @@ func userAllowOther() bool {
 // mount is owned by this user while the runtime's virtiofs server may run
 // as another (a root Docker daemon's does); without allow_other the kernel
 // refuses it access and the guest would see an unusable share. Requiring it
-// is deliberately conservative — a same-uid virtiofsd (rootless Podman with
-// libkrun) would not need it — because the alternative is a box that comes
-// up and then fails opaquely.
+// is deliberately conservative — a same-uid virtiofsd would not need it —
+// because the alternative is a box that comes up and then fails opaquely.
 //
 // The result feeds mask-mode resolution; an unavailable seam must degrade
 // loudly, never silently.
