@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+
+	"github.com/sblmnl/agentbox/internal/netpol"
 )
 
 // ContainerBackend drives Docker or rootless Podman. Runner is
@@ -43,14 +45,23 @@ func (c *ContainerBackend) PrepareRootfs(*BoxSpec) error { return nil }
 // expressed on the container spec in Create.
 func (c *ContainerBackend) SetupShare(*BoxSpec) error { return nil }
 
-// CreateNetwork creates the internal (no-gateway) box network and the
-// egress network the proxy sidecar straddles: the guest has no route
-// to any external address, so a tool ignoring HTTPS_PROXY fails closed.
+// CreateNetwork creates the box network and, in proxy mode, the egress
+// network the proxy sidecar straddles.
+//
+// In proxy and off mode the box network is --internal: the guest has no route
+// to any external address, so a tool that ignores HTTPS_PROXY fails closed
+// rather than reaching the internet directly. Open mode is the one case where
+// the box is meant to have an ordinary route, and it says so on every
+// invocation.
 func (c *ContainerBackend) CreateNetwork(spec *BoxSpec) error {
-	if err := c.run("network", "create", "--internal", spec.ResourceName+"-int"); err != nil {
+	args := []string{"network", "create"}
+	if spec.Policy == nil || spec.Policy.Mode != netpol.ModeOpen {
+		args = append(args, "--internal")
+	}
+	if err := c.run(append(args, spec.ResourceName+"-int")...); err != nil {
 		return err
 	}
-	if spec.Policy != nil && spec.Policy.Mode == "proxy" {
+	if spec.Policy != nil && spec.Policy.Mode == netpol.ModeProxy {
 		return c.run("network", "create", spec.ResourceName+"-egress")
 	}
 	return nil
@@ -124,15 +135,18 @@ func (c *ContainerBackend) Create(spec *BoxSpec) error {
 		return err
 	}
 
-	if spec.Policy != nil && spec.Policy.Mode == "proxy" {
-		if err := c.createProxySidecar(spec); err != nil {
+	if spec.Policy != nil && spec.Policy.Mode == netpol.ModeProxy {
+		if err := createProxySidecar(c.Runner, c.RuntimeBin, spec); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *ContainerBackend) createProxySidecar(spec *BoxSpec) error {
+// createProxySidecar builds a box's squid sidecar. Both tiers share it: the
+// policy engine, its configuration and its hardening must not be able to
+// differ between them, or an allowlist would mean two things.
+func createProxySidecar(runner func(...string) *exec.Cmd, engineBin string, spec *BoxSpec) error {
 	proxyName := spec.ResourceName + "-proxy"
 	// non-root, unprivileged port, all capabilities dropped,
 	// read-only root. One sidecar per box keeps per-box process isolation
@@ -145,18 +159,31 @@ func (c *ContainerBackend) createProxySidecar(spec *BoxSpec) error {
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
 		"--user", "31337:31337",
-		"--tmpfs", "/var/log/squid:size=64m",
-		"--tmpfs", "/var/spool/squid:size=16m",
-		"--tmpfs", "/run:size=4m",
+		// mode=1777 is load-bearing, not decoration. Docker only defaults a
+		// tmpfs to 1777 when the mountpoint does not already exist in the
+		// image; all three of these do exist in ubuntu/squid, so the mount
+		// inherits the image directory's 0755 root:root and the sidecar --
+		// which runs as 31337 with no capabilities -- cannot write its pid
+		// file or its access log. Squid then exits FATAL before binding, and
+		// every request from the box fails in a way that reads like a network
+		// bug rather than a dead proxy.
+		"--tmpfs", "/var/log/squid:size=64m,mode=1777",
+		"--tmpfs", "/var/spool/squid:size=16m,mode=1777",
+		"--tmpfs", "/run:size=4m,mode=1777",
 		"--mount", "type=bind,src=" + spec.ProxyConfigPath() + ",dst=/etc/squid/squid.conf,readonly",
-		"ubuntu/squid:latest",
 	}
-	if err := c.run(args...); err != nil {
+	if spec.ProxyAddr != "" {
+		// The vm tier pins the address because its guest cannot resolve
+		// container names; see VMBackend.CreateNetwork.
+		args = append(args, "--ip", spec.ProxyAddr)
+	}
+	args = append(args, "ubuntu/squid:latest")
+	if err := engineRun(engineBin, runner, args...); err != nil {
 		return err
 	}
 	// The sidecar also joins the egress network; the box container does
 	// not, so the internal bridge is its only path.
-	return c.run("network", "connect", spec.ResourceName+"-egress", proxyName)
+	return engineRun(engineBin, runner, "network", "connect", spec.ResourceName+"-egress", proxyName)
 }
 
 // ProxyConfigPath is where the generated squid.conf for this box lives.
@@ -167,15 +194,32 @@ func (s *BoxSpec) ProxyConfigPath() string { return s.proxyConfigPath }
 func (s *BoxSpec) SetProxyConfigPath(p string) { s.proxyConfigPath = p }
 
 func (c *ContainerBackend) Start(spec *BoxSpec) error {
-	if spec.Policy != nil && spec.Policy.Mode == "proxy" {
+	if spec.Policy != nil && spec.Policy.Mode == netpol.ModeProxy {
 		// The guest is not ready before its proxy is: a running
 		// guest behind a dead proxy fails every network call in a way that
 		// reads like a bug in the user's code.
+		if err := ensureSidecarExists(c.Runner, c.RuntimeBin, spec); err != nil {
+			return err
+		}
 		if err := c.run("start", spec.ResourceName+"-proxy"); err != nil {
 			return err
 		}
 	}
 	return c.run("start", spec.ResourceName)
+}
+
+// ensureSidecarExists recreates a missing proxy sidecar before start.
+//
+// A create interrupted between the guest and its sidecar leaves the guest
+// present and the sidecar absent. Every later `up` then finds the guest, skips
+// creation entirely, and fails starting a sidecar that was never made -- a
+// box wedged permanently by one Ctrl-C. Recreating the missing half is what
+// makes creation recoverable rather than a one-shot.
+func ensureSidecarExists(runner func(...string) *exec.Cmd, engineBin string, spec *BoxSpec) error {
+	if _, err := engineInspect(runner, engineBin, spec.ResourceName+"-proxy"); err == nil {
+		return nil
+	}
+	return createProxySidecar(runner, engineBin, spec)
 }
 
 func (c *ContainerBackend) Stop(name string) error {
@@ -220,6 +264,24 @@ func (c *ContainerBackend) Logs(name string, proxy bool, follow bool) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func (c *ContainerBackend) ProxyLogCmd(name string, follow bool) *exec.Cmd {
+	return proxyLogCmd(c.Runner, name, follow)
+}
+
+func (c *ContainerBackend) RemoveImage(ref string) error {
+	return c.run("image", "rm", ref)
+}
+
+// proxyLogCmd is shared by both tiers: the sidecar is an ordinary container
+// under each, so its log is read the same way.
+func proxyLogCmd(runner func(...string) *exec.Cmd, name string, follow bool) *exec.Cmd {
+	args := []string{"logs"}
+	if follow {
+		args = append(args, "-f")
+	}
+	return runner(append(args, name+"-proxy")...)
 }
 
 // VerifyWorkspaceWritable checks the workspace mount from inside a started

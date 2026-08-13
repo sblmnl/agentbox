@@ -1,5 +1,4 @@
-// Package state implements the on-disk layout, project and box
-// metadata, and two-level locking.
+// Package state implements the on-disk layout, box metadata, and locking.
 package state
 
 import (
@@ -29,35 +28,34 @@ func CacheDir() string {
 	return filepath.Join(home, ".cache", "agentbox")
 }
 
-// ProjectMeta is projects/<key>/meta.json.
-type ProjectMeta struct {
-	WorkspaceRealpath string    `json:"workspace_realpath"`
-	Slug              string    `json:"slug"`
-	DefaultBox        string    `json:"default_box"`
-	CreatedAt         time.Time `json:"created_at"`
-	// VMTierNoticed records that the one-time notice about
-	// auto-selecting the vm tier has been shown for this workspace.
-	VMTierNoticed bool `json:"vm_tier_noticed,omitempty"`
-}
-
-// BoxMeta is boxes/<instance>/meta.json: everything frozen at
-// creation, recomputed and compared on every subsequent invocation.
+// BoxMeta is boxes/<key>/meta.json: everything frozen at creation, recomputed
+// and compared on every subsequent invocation so that configuration drift is
+// noticed rather than silently applied to a box that predates it.
+//
+// One box per workspace root means this is also the project record; there is
+// no second level of identity and no instance name.
 type BoxMeta struct {
-	Instance       string    `json:"instance"`
-	ProjectKey     string    `json:"project_key"`
-	Backend        string    `json:"backend"`
-	Tier           string    `json:"tier"`
-	TreeMode       string    `json:"tree_mode"`
-	TreeRoot       string    `json:"tree_root"`
-	Branch         string    `json:"branch,omitempty"` // worktree mode
-	ConfigDigest   string    `json:"config_digest"`
-	ImageRef       string    `json:"image_ref"`
+	Key               string `json:"key"`
+	WorkspaceRealpath string `json:"workspace_realpath"`
+	Slug              string `json:"slug"`
+	Backend           string `json:"backend"`
+	Tier              string `json:"tier"`
+	ConfigDigest      string `json:"config_digest"`
+	ImageRef          string `json:"image_ref"`
+	// ImageBuilt records that agentbox built this image rather than being
+	// pointed at one. `rm` reclaims only what agentbox made: deleting a
+	// pinned [image].ref would take out an image the user owns, and quite
+	// possibly one other things on the host depend on.
+	ImageBuilt     bool      `json:"image_built"`
 	MaskDigest     string    `json:"mask_digest"`
 	MaskMode       string    `json:"mask_mode"`
 	ForceIsolation string    `json:"force_isolation,omitempty"` // recorded and surfaced
 	MemoryLimit    string    `json:"memory_limit"`
 	CreatedAt      time.Time `json:"created_at"`
 	LastExecAt     time.Time `json:"last_exec_at"`
+	// VMTierNoticed records that the one-time notice about auto-selecting the
+	// vm tier has been shown for this workspace.
+	VMTierNoticed bool `json:"vm_tier_noticed,omitempty"`
 }
 
 // Store wraps the state directory root (injectable for tests).
@@ -70,51 +68,35 @@ func Open(root string) *Store {
 	return &Store{Root: root}
 }
 
-func (s *Store) ProjectDir(key string) string { return filepath.Join(s.Root, "projects", key) }
-func (s *Store) BoxDir(key, instance string) string {
-	return filepath.Join(s.ProjectDir(key), "boxes", instance)
-}
-func (s *Store) TreeDir(key, instance string) string {
-	return filepath.Join(s.BoxDir(key, instance), "tree")
-}
+func (s *Store) BoxDir(key string) string { return filepath.Join(s.Root, "boxes", key) }
 
-func (s *Store) LoadProject(key string) (*ProjectMeta, error) {
-	var m ProjectMeta
-	if err := readJSON(filepath.Join(s.ProjectDir(key), "meta.json"), &m); err != nil {
-		return nil, err
-	}
-	return &m, nil
-}
-
-func (s *Store) SaveProject(key string, m *ProjectMeta) error {
-	dir := s.ProjectDir(key)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	return writeJSON(filepath.Join(dir, "meta.json"), m)
-}
-
-func (s *Store) LoadBox(key, instance string) (*BoxMeta, error) {
+func (s *Store) LoadBox(key string) (*BoxMeta, error) {
 	var m BoxMeta
-	if err := readJSON(filepath.Join(s.BoxDir(key, instance), "meta.json"), &m); err != nil {
+	if err := readJSON(filepath.Join(s.BoxDir(key), "meta.json"), &m); err != nil {
 		return nil, err
 	}
 	return &m, nil
 }
 
 func (s *Store) SaveBox(m *BoxMeta) error {
-	dir := s.BoxDir(m.ProjectKey, m.Instance)
+	dir := s.BoxDir(m.Key)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	return writeJSON(filepath.Join(dir, "meta.json"), m)
 }
 
-// ListBoxes returns a project's boxes ordered by creation time — the order
-// that defines ordinal aliases.
-func (s *Store) ListBoxes(key string) ([]*BoxMeta, error) {
-	dir := filepath.Join(s.ProjectDir(key), "boxes")
-	ents, err := os.ReadDir(dir)
+// BoxExists reports whether a box record exists for this workspace.
+func (s *Store) BoxExists(key string) bool {
+	_, err := os.Stat(filepath.Join(s.BoxDir(key), "meta.json"))
+	return err == nil
+}
+
+// ListBoxes enumerates every box agentbox knows about, ordered by creation
+// time. Used only for teardown and diagnostics; addressing a box is done by
+// standing in its workspace.
+func (s *Store) ListBoxes() ([]*BoxMeta, error) {
+	ents, err := os.ReadDir(filepath.Join(s.Root, "boxes"))
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -126,58 +108,21 @@ func (s *Store) ListBoxes(key string) ([]*BoxMeta, error) {
 		if !e.IsDir() {
 			continue
 		}
-		if m, err := s.LoadBox(key, e.Name()); err == nil {
+		if m, err := s.LoadBox(e.Name()); err == nil {
 			boxes = append(boxes, m)
 		}
 	}
 	sort.Slice(boxes, func(i, j int) bool {
 		if boxes[i].CreatedAt.Equal(boxes[j].CreatedAt) {
-			return boxes[i].Instance < boxes[j].Instance
+			return boxes[i].Key < boxes[j].Key
 		}
 		return boxes[i].CreatedAt.Before(boxes[j].CreatedAt)
 	})
 	return boxes, nil
 }
 
-// ListProjects enumerates all project keys.
-func (s *Store) ListProjects() ([]string, error) {
-	ents, err := os.ReadDir(filepath.Join(s.Root, "projects"))
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var keys []string
-	for _, e := range ents {
-		if e.IsDir() {
-			keys = append(keys, e.Name())
-		}
-	}
-	sort.Strings(keys)
-	return keys, nil
-}
-
-// ResolveOrdinal maps a decimal alias to an instance name: ordered
-// by creation time, 1-based. Aliases are display sugar and never appear in
-// meta.json.
-func (s *Store) ResolveOrdinal(key string, n int) (string, error) {
-	boxes, err := s.ListBoxes(key)
-	if err != nil {
-		return "", err
-	}
-	if n < 1 || n > len(boxes) {
-		return "", fmt.Errorf("no box with ordinal %d (project has %d)", n, len(boxes))
-	}
-	return boxes[n-1].Instance, nil
-}
-
-func (s *Store) RemoveBox(key, instance string) error {
-	return os.RemoveAll(s.BoxDir(key, instance))
-}
-
-func (s *Store) RemoveProject(key string) error {
-	return os.RemoveAll(s.ProjectDir(key))
+func (s *Store) RemoveBox(key string) error {
+	return os.RemoveAll(s.BoxDir(key))
 }
 
 // GeneratedFileHeader builds the header generated files carry, naming

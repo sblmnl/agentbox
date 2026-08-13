@@ -95,10 +95,19 @@ func BuildView(treeRoot, viewRoot string, ops []MountOp) error {
 // mask mount stacked on it. Idempotent: a path that is not a mountpoint (or
 // does not exist) is not an error, so recreate and remove paths can call it
 // unconditionally.
+//
+// The mountpoint check is what makes that idempotence real for an
+// unprivileged process. umount(2) checks CAP_SYS_ADMIN *before* it checks
+// whether the path is a mount at all, so unmounting a plain directory as a
+// normal user returns EPERM rather than the EINVAL this used to treat as
+// "nothing mounted" -- which made `rm` fail on every filter-mode box whose
+// share daemon had already retracted its own mount.
 func TeardownView(viewRoot string) error {
-	err := syscall.Unmount(viewRoot, syscall.MNT_DETACH)
-	if err != nil && err != syscall.EINVAL && !os.IsNotExist(err) {
-		return fmt.Errorf("unmounting view %s: %w", viewRoot, err)
+	if IsMountPoint(viewRoot) {
+		err := syscall.Unmount(viewRoot, syscall.MNT_DETACH)
+		if err != nil && err != syscall.EINVAL && !os.IsNotExist(err) {
+			return fmt.Errorf("unmounting view %s: %w", viewRoot, err)
+		}
 	}
 	if err := os.Remove(viewRoot); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("removing view root %s: %w", viewRoot, err)

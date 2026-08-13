@@ -16,17 +16,15 @@ import (
 	"github.com/sblmnl/agentbox/internal/mask"
 	"github.com/sblmnl/agentbox/internal/netpol"
 	"github.com/sblmnl/agentbox/internal/share"
-	"github.com/sblmnl/agentbox/internal/tree"
 	"github.com/sblmnl/agentbox/internal/workspace"
 )
 
-// Plan is the full "what would this do" for one box (--dry-run and the
-// inspection commands). Building a plan never creates or starts anything.
+// Plan is the full "what would this do" for the workspace's box. Building a
+// plan never creates or starts anything, which is what lets --dry-run answer
+// the question honestly: the plan printed is the plan enacted.
 type Plan struct {
-	BoxID        string                  `json:"box_id"`
-	Instance     string                  `json:"instance"`
+	Key          string                  `json:"key"`
 	ResourceName string                  `json:"resource_name"` // see ResourceNameFor
-	TreeMode     string                  `json:"tree_mode"`
 	TreeRoot     string                  `json:"tree_root"`
 	Backend      backend.Availability    `json:"backend"`
 	Floor        string                  `json:"isolation_floor"`
@@ -75,33 +73,44 @@ func resolveMaskMode(mode string, tier backend.Tier) (resolved, warning string, 
 	}
 }
 
-// BuildPlan computes everything needed to create or inspect a box without
-// touching runtime state. instance may be "" for "the box that would be
-// created"; existingTreeRoot overrides tree resolution for an existing box.
 // ResourceNameFor derives the engine resource name for a box. It is the
-// single derivation: prune decides what the engine holds that no box claims
-// by matching against this, and a second copy that drifted would let it
-// treat a live box's container as an orphan.
-func ResourceNameFor(slug, key, instance string) string {
+// single derivation: teardown decides what the engine holds for this box by
+// matching against it, and a second copy that drifted would let it miss a
+// live container or claim someone else's.
+func ResourceNameFor(slug, key string) string {
 	digest := key[strings.LastIndex(key, "-")+1:]
-	return backend.ResourcePrefix + identity.TruncateForLimit(slug, digest, instance, 63)
+	return backend.ResourcePrefix + identity.TruncateForLimit(slug, digest, 63)
 }
 
-func (c *Ctx) BuildPlan(instance, treeMode, existingTreeRoot string) (*Plan, error) {
-	return c.buildPlan(instance, treeMode, existingTreeRoot, false)
+// BuildPlan computes everything needed to create or inspect the box without
+// touching runtime state.
+func (c *Ctx) BuildPlan() (*Plan, error) { return c.buildPlan(false) }
+
+// BuildPlanLenient is for the inspection paths (`config`, `--dry-run`), which
+// answer "what would this do" and must work before any backend exists.
+// Selection failure degrades to a hypothetical backend at the floor tier
+// instead of exit 69; creation paths stay strict.
+func (c *Ctx) BuildPlanLenient() (*Plan, error) { return c.buildPlan(true) }
+
+// planFor picks the strictness a command needs: lenient under --dry-run,
+// strict otherwise.
+//
+// A dry run changes nothing, so refusing to produce one is refusing to answer
+// a question. The box whose backend has since gone missing -- Docker stopped
+// after the box was created -- is exactly when "what would this do" is worth
+// asking, and exiting 69 with no plan there hides the answer behind the
+// problem the user is trying to diagnose. The refusal is not lost: the plan
+// reports the unsatisfiable floor as a warning of its own.
+func (c *Ctx) planFor() (*Plan, error) {
+	if c.Opts.DryRun {
+		return c.BuildPlanLenient()
+	}
+	return c.BuildPlan()
 }
 
-// BuildPlanLenient is for the inspection commands (config, mounts,
-// masks, doctor answer "what would this do" and must work before any
-// backend exists). Selection failure degrades to a hypothetical backend at
-// the floor tier instead of exit 69; creation paths stay strict.
-func (c *Ctx) BuildPlanLenient(instance, treeMode, existingTreeRoot string) (*Plan, error) {
-	return c.buildPlan(instance, treeMode, existingTreeRoot, true)
-}
-
-func (c *Ctx) buildPlan(instance, treeMode, existingTreeRoot string, lenient bool) (*Plan, error) {
+func (c *Ctx) buildPlan(lenient bool) (*Plan, error) {
 	cfg := c.Cfg.Config
-	p := &Plan{Instance: instance, Floor: cfg.Security.MinIsolation}
+	p := &Plan{Floor: cfg.Security.MinIsolation}
 
 	// Backend selection.
 	forced := backend.Tier("")
@@ -131,60 +140,13 @@ func (c *Ctx) buildPlan(instance, treeMode, existingTreeRoot string, lenient boo
 	}
 	p.Backend = av
 
-	// Tree resolution.
-	boxes, _ := c.Store.ListBoxes(c.Key)
-	isGit := tree.IsGitRepo(c.Workspace)
-	mode := treeMode
-	if mode == "" {
-		mode = cfg.Workspace.TreeMode
-	}
-	mode = tree.ResolveAuto(mode, len(boxes), isGit)
-	p.TreeMode = mode
-	if existingTreeRoot != "" {
-		p.TreeRoot = existingTreeRoot
-	} else if mode == tree.ModeShared {
-		p.TreeRoot = c.Workspace
-	} else {
-		p.TreeRoot = c.Store.TreeDir(c.Key, orPlaceholder(instance))
-	}
-	if mode == tree.ModeShared {
-		var others []string
-		for _, b := range boxes {
-			if b.TreeMode == tree.ModeShared && b.Instance != instance {
-				others = append(others, b.Instance)
-			}
-		}
-		if len(others) > 0 {
-			p.Warnings = append(p.Warnings, fmt.Sprintf(
-				"this box shares its working tree with box(es) %s; two agents editing one tree will overwrite each other's work unless supervised",
-				strings.Join(others, ", ")))
-		}
-	}
-
-	// Instance naming if not yet decided.
-	if p.Instance == "" {
-		taken := map[string]bool{}
-		for _, b := range boxes {
-			taken[b.Instance] = true
-		}
-		switch {
-		case c.Opts.Name != "" && !identity.IsBareInteger(c.Opts.Name):
-			p.Instance = c.Opts.Name
-		case mode == tree.ModeWorktree && isGit && tree.CurrentBranch(c.Workspace) != "":
-			cand := identity.SanitizeSlug(tree.CurrentBranch(c.Workspace))
-			if identity.ValidInstanceName(cand) && !taken[cand] && !identity.IsBareInteger(cand) {
-				p.Instance = cand
-			}
-		}
-		if p.Instance == "" {
-			p.Instance = identity.GenerateName(taken, nil)
-		}
-		if p.TreeRoot == c.Store.TreeDir(c.Key, "__pending__") {
-			p.TreeRoot = c.Store.TreeDir(c.Key, p.Instance)
-		}
-	}
-	p.BoxID = identity.BoxID(c.Key, p.Instance)
-	p.ResourceName = ResourceNameFor(c.Slug, c.Key, p.Instance)
+	// The box mounts the workspace itself. There is no separate tree to
+	// materialize: a second box on the same project is a second workspace
+	// root (`git worktree add`), which agentbox sees as a different project
+	// entirely and gives its own box, branch and all.
+	p.TreeRoot = c.Workspace
+	p.Key = c.Key
+	p.ResourceName = ResourceNameFor(c.Slug, c.Key)
 
 	// Mask mode and mask set.
 	maskMode, maskWarn, err := resolveMaskMode(cfg.Security.MaskMode, av.Tier)
@@ -212,14 +174,7 @@ func (c *Ctx) buildPlan(instance, treeMode, existingTreeRoot string, lenient boo
 			return nil, Configf("%v", err)
 		}
 		p.MaskSources = blobs
-		maskTree := p.TreeRoot
-		if _, err := filepath.EvalSymlinks(maskTree); err != nil {
-			// The tree does not exist yet (worktree/copy not materialized):
-			// compute the preview against the workspace; the definitive set
-			// is recomputed at creation against the box's own tree.
-			maskTree = c.Workspace
-		}
-		set, err := mask.Compute(maskTree, matcher, maskMode, sources)
+		set, err := mask.Compute(p.TreeRoot, matcher, maskMode, sources)
 		if err != nil {
 			return nil, Softwaref("computing mask set: %v", err)
 		}
@@ -239,6 +194,7 @@ func (c *Ctx) buildPlan(instance, treeMode, existingTreeRoot string, lenient boo
 	// Image.
 	p.Image = image.Resolve(cfg)
 	p.Warnings = append(p.Warnings, p.Image.Warnings...)
+	p.Warnings = append(p.Warnings, agentBundleWithoutInstall(cfg, p.Image)...)
 
 	// Environment: [variables], telemetry silencing, passthrough,
 	// proxy variables in both casings.
@@ -267,7 +223,7 @@ func (c *Ctx) buildPlan(instance, treeMode, existingTreeRoot string, lenient boo
 
 	// Backend-neutral box spec.
 	spec := &backend.BoxSpec{
-		BoxID:        p.BoxID,
+		BoxID:        p.Key,
 		ResourceName: p.ResourceName,
 		ImageRef:     p.Image.Ref,
 		TreeRoot:     p.TreeRoot,
@@ -283,7 +239,8 @@ func (c *Ctx) buildPlan(instance, treeMode, existingTreeRoot string, lenient boo
 		Nofile:       cfg.Resources.Nofile,
 		GuestRoot:    av.Tier == backend.TierVM && cfg.Security.VM.GuestRoot == "allow",
 
-		StateDir:            c.Store.BoxDir(c.Key, p.Instance),
+		StateDir: c.Store.BoxDir(c.Key),
+
 		ProxyReadTimeout:    cfg.Network.Proxy.ReadTimeout,
 		ProxyRequestTimeout: cfg.Network.Proxy.RequestTimeout,
 	}
@@ -296,22 +253,64 @@ func (c *Ctx) buildPlan(instance, treeMode, existingTreeRoot string, lenient boo
 	if p.Masks != nil {
 		spec.MaskPlan = p.Masks.Layer0Plan(cfg.Workspace.Mount, cfg.Masking.TmpfsSize, cfg.Masking.FilesReadonly)
 	}
-	if pol.Mode == netpol.ModeProxy && av.Tier == backend.TierContainer {
-		// Sidecar topology: the proxy is resolvable by container DNS name.
-		// Under vm the backend computes ProxyEnv at create time, once the
-		// box's bridge gateway — where the host daemon listens — is known.
-		proxyURL := "http://" + p.ResourceName + "-proxy:3128"
-		spec.ProxyEnv = netpol.ProxyEnv(proxyURL)
+	if pol.Mode == netpol.ModeProxy {
+		// The generated squid.conf lives at a path derived from the box key,
+		// so it is set here rather than when the file happens to be written.
+		// A plan built for `up` or `run` is not the plan that created the box,
+		// and a spec that only knew its own proxy config on the creating plan
+		// would hand the engine an empty --mount source on every later start.
+		spec.SetProxyConfigPath(filepath.Join(c.Store.BoxDir(c.Key), "proxy", "squid.conf"))
+		if av.Tier == backend.TierContainer {
+			// The container tier reaches its sidecar by container DNS name.
+			// The vm tier cannot -- the engine's embedded resolver is
+			// unreachable from a VM guest -- so its backend sets ProxyEnv from
+			// the pinned sidecar IP once the box subnet is allocated.
+			spec.ProxyEnv = netpol.ProxyEnv("http://" + p.ResourceName + "-proxy:3128")
+		}
 	}
 	p.Spec = spec
 	return p, nil
 }
 
-func orPlaceholder(instance string) string {
-	if instance == "" {
-		return "__pending__"
+// agentBundleWithoutInstall catches a half-configured agent: egress opened for
+// a tool that was never installed.
+//
+// The two settings are a character apart in the places people copy them from
+// -- `[network].bundles = ["agent:claude-code"]` and
+// `[agents].install = ["claude-code"]` -- and dropping one while keeping the
+// other produces no failure until the agent is actually run, at which point
+// the runtime reports a missing file against a container id. Catching it while
+// building the plan puts the diagnosis before the symptom.
+//
+// It fires only when agentbox generates the image. A pinned [image].ref or a
+// user's own Dockerfile may perfectly well already contain the agent, and
+// nagging about a correct configuration is how warnings get ignored.
+func agentBundleWithoutInstall(cfg *config.Config, img image.Resolution) []string {
+	if img.Source != "build" {
+		return nil
 	}
-	return instance
+	installed := map[string]bool{}
+	for _, a := range cfg.Agents.Install {
+		installed[a] = true
+	}
+	var out []string
+	for _, b := range cfg.Network.Bundles {
+		name, ok := strings.CutPrefix(b, "agent:")
+		if !ok {
+			continue
+		}
+		// "agent:claude-code:telemetry" is an add-on to the same agent.
+		name, _, _ = strings.Cut(name, ":")
+		if installed[name] {
+			continue
+		}
+		out = append(out, fmt.Sprintf(
+			"[network].bundles allows egress for %q but [agents].install does not include %q, "+
+				"so the agent is not in the image; add it, or drop the bundle if the agent comes from elsewhere",
+			b, name))
+		installed[name] = true // one warning per agent, not per bundle entry
+	}
+	return out
 }
 
 // MaskDigest hashes what is frozen for drift comparison. Under view mode

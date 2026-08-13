@@ -1,421 +1,266 @@
-.TH AGENTBOX 1 "2026-08-07" "agentbox 0.0.1-dev" "User Commands"
+.TH AGENTBOX 1 "2026-08-10" "agentbox 0.0.1-dev" "User Commands"
 .SH NAME
-agentbox \- run an agentic coding tool inside an isolated, per-project environment
+agentbox \- run an agentic coding tool in an isolated per-project environment
 .SH SYNOPSIS
 .B agentbox
-.RI [ "GLOBAL FLAGS" ]
+.RI [ flags ]
 .RI [ COMMAND ]
-.RI [ ARGS... ]
+.RI [ ARGS ...]
 .br
 .B agentbox
-.RI [ "GLOBAL FLAGS" ]
+.RI [ flags ]
 .B \-\-
 .I COMMAND-IN-BOX
-.RI [ ARGS... ]
+.RI [ ARGS ...]
 .SH DESCRIPTION
 .B agentbox
-runs a command \(em typically an agentic coding tool such as
-.B claude
-\(em inside an isolated environment built for the current project, with no
-per-project setup.
-Invoking
-.B agentbox claude
-resolves the project root, merges configuration, selects a backend
-satisfying the project's declared isolation floor, builds or pulls an image
-matching the declared toolchains, constructs a masked view of the workspace
-that hides secrets, starts a default-deny egress proxy, and executes the
-agent with the working directory mapped to match the shell's.
+runs an agentic coding tool inside an isolated environment built for the
+current project. It resolves the workspace root, merges layered
+configuration, selects a backend satisfying the project's declared isolation
+floor, builds an image matching the declared toolchains, constructs a masked
+view of the workspace that hides secrets, starts a default-deny egress
+proxy, and execs the agent with the working directory mapped to match your
+shell's.
 .PP
-If the first non-flag argument is not a reserved subcommand, it and
-everything after it is treated as a command to run inside the box.
+There is exactly
+.B one box per workspace root.
+The directory is the box's identity: there is no instance name, no default
+box, and nothing to choose between. A project gets a second box by getting a
+second root \(em
+.B git worktree add ../feature
+is a different directory, so it gets its own box, on its own branch, for
+free.
+.PP
+The first non-flag argument is
+.I interpreted:
+if it names a reserved subcommand it dispatches to that subcommand;
+otherwise the whole argument list is a command to run inside the box.
 .B \-\-
-forces that interpretation, so
-.B "agentbox \-\- \-\-version"
-runs
-.B \-\-version
-in the box.
-With no arguments,
-.B agentbox
-runs
-.IR [box].default_command ,
-itself defaulting to an interactive login shell.
+forces the in-box interpretation. When an argument matches a reserved
+subcommand but is not in first position, agentbox prints a note to stderr
+suggesting
+.BR \-\- .
 .PP
-A project may hold several named
-.IR boxes .
-Bare
-.B agentbox
-attaches to the project's default box, creating one if the project has none.
-See
-.B "BOX SELECTION"
-below.
+The reserved set is closed and documented:
+.PP
+.RS
+run shell up down status logs build config init rm version help
+.RE
 .SH SUBCOMMANDS
 .TP
-.BI "run " CMD...
-Explicit form of the default behavior: run
-.I CMD
-in the box.
+.BR run " \fICOMMAND\fR [\fIARGS\fR...]"
+Run a command in the box, creating and starting it if necessary. The
+command's exit code is returned verbatim.
 .TP
 .B shell
-Interactive login shell in the box.
-.TP
-.BR new " [" \-\-name " \fIN\fR]"
-Create an additional box in this project without attaching.
-.TP
-.BR attach " [" \-n " \fIN\fR]"
-Attach to an existing box. Never creates one.
-.TP
-.BI "default " NAME
-Set the project's default box.
+Open an interactive shell in the box.
 .TP
 .B up
-Create and start the box; do not exec.
-.TP
-.B stop
-Stop a box, retaining its state and tree, freeing guest memory.
+Create and start the box without running anything in it.
 .TP
 .B down
-Stop and remove the guest and networks; keep persistent state.
+Stop the box and remove its guest and networks. The persistent home and the
+box's identity survive, so a later
+.B agentbox
+brings back the same box rather than a fresh one.
 .TP
-.B restart
-Recreate the box, applying current configuration.
+.B rm
+Remove the box and everything it holds: guest, networks, persistent home
+volume, recorded state, and the image agentbox built for it. An image pinned
+with
+.B [image].ref
+is never removed \(em agentbox reclaims only what it made. Pass
+.B \-\-keep\-image
+to retain a built image as well.
 .TP
-.BR status " [" \-\-all "] [" \-\-artifacts ]
-Box state, active backend and the properties it enforces, drift, network
-policy, and a mask summary. Always prints the box's instance name, tree
-mode, backend, and isolation tier: with several boxes per project, "which
-box am I looking at" is as easy to get wrong as "which tier am I getting".
-.B \-\-all
-covers every box in the project.
-.IP
-.B \-\-artifacts
-adds everything agentbox is holding for the box: its container, networks and
-home volume, its image, the host-side mask view and proxy listener under the
-vm tier, its working tree and branch, and its state directory. Each is
-resolved against what is actually there, so an artifact the box expects and
-the engine does not hold reads
-.BR MISSING ,
-and one the box's name claims but that it was not created with reads
-.BR unexpected .
-What a box expects is taken from what it was created with, not from current
-configuration \(em ordinary drift has its own line and is not an absence.
-.BR "agentbox ls \-\-artifacts"
-is the same view across boxes, and adds what nothing claims.
+.B status
+Print what this workspace's box is and what is in force for it: backend and
+isolation tier, run state, image, mask mode and how many paths it hides,
+egress mode and how many domains it allows, and any drift from current
+configuration. Never creates a box.
 .TP
-.B ps
-Processes running in the box.
-.TP
-.BR logs " [" \-\-proxy "] [" \-\-denied "] [" \-f ]
-Logs.
+.B logs
+Stream the box's logs.
+.B \-\-proxy
+streams the egress proxy's log instead;
 .B \-\-denied
-filters the proxy log to refused requests \(em the answer to "what did the
-agent try to reach".
+filters it to refused requests;
+.BR \-f / \-\-follow
+follows.
 .TP
-.BR build " [" \-\-no\-cache ]
+.B build
 Build or rebuild the image.
+.B \-\-no\-cache
+discards cached layers.
 .TP
-.BR config " [" \-\-json "] [" \-\-origin ]
-Effective merged configuration.
+.B config
+Print the effective merged configuration.
 .B \-\-origin
 annotates each key with the layer that set it.
 .TP
-.BR mounts " [" \-\-json ]
-Every path presented to the guest, every mask, and the reason for each.
-.TP
-.BR masks " [" \-\-json "] [" \-\-verify ]
-Effective mask set.
-.B \-\-verify
-asserts each mask is actually in force in a running box.
-.TP
-.BR backends " [" \-\-json ]
-Available backends, their isolation tiers, and why any are unavailable.
-.TP
-.BI "allow " DOMAIN...
-Append to the workspace config's allowlist. Rewrites the file structurally;
-comments are not preserved (the command says so when it runs). Does not
-invalidate recorded trust, since the edit was explicitly requested.
-.TP
-.BR bundles " [" \-\-list "] [" \-\-show " \fINAME\fR]"
-Inspect built-in egress domain bundles. An opaque allowlist is not
-auditable.
-.TP
-.BR init " [" \-\-profile " \fIP\fR]"
+.B init
 Scaffold
 .B agentbox.toml
 and
-.BR .agentignore .
+.B .agentignore
+in the workspace root. This is the only command that writes to the
+workspace, and only on explicit invocation.
 .TP
-.BR ls " [" \-\-project "] [" \-\-all "] [" \-\-artifacts ]
-Boxes grouped by project: instance name, backend, tier, tree mode, age,
-resources. Boxes created with
-.B \-\-force\-isolation
-and boxes whose workspace no longer resolves are flagged. On its own
-.B ls
-contacts no engine, so it answers with the container daemon stopped.
-.IP
-.B \-\-artifacts
-opts into the unified view: each box's live state, everything it is holding
-(as described under
-.BR status ),
-and a closing list of every agentbox artifact on the host that no box in
-agentbox state claims \(em always computed across all projects, since
-"unclaimed" is only true when nothing claims it, and reclaimable with
-.BR "agentbox prune" .
-The two lists are the same join read in opposite directions: nothing appears
-in both.
+.B version
+Print the agentbox version and each backend's availability.
 .TP
-.BR rm " [" \-\-state "] [" \-\-delete\-branch "] [" \fIID\fR ]
-Remove a box and its worktree.
-.B \-\-state
-also discards persistent guest state. The box's git branch is preserved
-unless
-.B \-\-delete\-branch
-is given: unreviewed agent work is the most valuable thing in the box and
-the easiest to destroy by accident.
-.TP
-.BR prune " [" \-\-apply "] [" \-\-images "] [" \-\-idle "] [" \-\-boxes "] [" \-\-running "] [" \-\-state ]
-Report what agentbox has left behind and can reclaim: state for vanished
-workspaces, engine containers, networks and volumes that no box in agentbox
-state claims, and mask views with no box to serve. Only resources agentbox
-itself would have created under that name are ever candidates.
-.IP
-Reports and removes nothing by default; the listing tells you what would go.
-.B \-\-apply
-reclaims it.
-.B \-\-images
-additionally considers built images no box references \(em they are excluded
-otherwise because rebuilding one is expensive and superseding one is routine.
-.B \-\-idle
-includes boxes past their idle timeout, which are stopped, never removed.
-Use
-.B \-\-json
-for the candidate set as data.
-.IP
-Live boxes are not candidates unless you say so.
-.B \-\-boxes
-widens the report to every
-.I stopped
-box in agentbox state, across all projects, and removes the guest, its
-networks and its working tree.
-.B \-\-running
-additionally includes boxes that are running.
-.B \-\-state
-additionally discards each box's persistent home. Neither means anything on
-its own: passing them without
-.B \-\-boxes
-is a usage error rather than a silent no-op. A box whose backend is
-unavailable on this host cannot be inspected, and is left alone as though it
-were running.
-.IP
-.B prune
-never deletes a git branch, at any combination of flags: the working tree of
-a removed box is gone, but the branch holding its unreviewed work survives.
-Boxes it deliberately left alone are named at the end of the run, so a
-partial teardown never reads as a complete one. The full teardown is
-.BR "agentbox prune \-\-apply \-\-boxes \-\-running \-\-state \-\-images" .
-.TP
-.B doctor
-Preflight: backends, KVM, kernel features, config validity, workspace
-trust, SSH remotes, image staleness.
-.TP
-.BR trust " [" \-\-show "] [" \-\-revoke ]
-Trust the workspace configuration. A committed
-.B agentbox.toml
-is executed by whoever clones the repository, so host-side
-.B [hooks]
-and
-.B [[workspace.mounts]]
-are refused until the file has been reviewed and trusted. Any edit to the
-file (or to a file it extends) invalidates trust.
-.B \-\-show
-prints the current trust status;
-.B \-\-revoke
-withdraws it.
-.TP
-.BI "completion " SHELL
-Print a completion script for
-.BR bash ", " zsh ", or " fish .
-.TP
-.BR version " [" \-\-json ]
-Tool version and backend versions.
-.PP
-.BR config ", " mounts ", " masks ", " backends ", and " doctor
-never create or start anything. They are the supported way to answer "what
-would this do" and "why can the agent see this file" before committing to a
-session.
+.B help
+Print usage.
 .SH GLOBAL FLAGS
 .TP
-.BR \-C ", " \-\-directory " \fIDIR\fR"
-Resolve the workspace as if from
+.BI \-C " DIR" "\fR, \fP" \-\-directory " DIR"
+Resolve the workspace as if invoked from
 .IR DIR .
 .TP
-.BR \-w ", " \-\-workspace " \fIDIR\fR"
+.BI \-w " DIR" "\fR, \fP" \-\-workspace " DIR"
 Override workspace-root detection.
 .TP
-.BR \-n ", " \-\-name " \fINAME\fR"
-Address a box by instance name or ordinal alias (a decimal integer, ordered
-by creation time).
-.TP
-.B \-\-new
-Create an additional box rather than attaching to an existing one.
-.TP
-.B \-\-all
-Apply
-.BR stop ", " down ", or " status
-to every box in the project.
-.TP
-.BI \-\-tree\-mode " MODE"
-Override
-.I [workspace].tree_mode
-for a box being created:
-.BR shared ", " worktree ", " copy ", or " auto .
-.TP
-.BR \-p ", " \-\-profile " \fINAME\fR"
-Apply a named profile overlay.
-.TP
-.BR \-c ", " \-\-config " \fIFILE\fR"
+.BI \-c " FILE" "\fR, \fP" \-\-config " FILE"
 Use
 .I FILE
-as the workspace configuration layer.
+as the workspace configuration layer, replacing any
+.B agentbox.toml
+found.
 .TP
 .B \-\-no\-config
-Ignore discovered configuration; built-in defaults only.
+Use built-in defaults and flags only; skip the user and workspace layers.
 .TP
-.BR \-b ", " \-\-backend " \fINAME\fR"
-Select a backend. Never selects one below the isolation floor.
+.BI \-b " NAME" "\fR, \fP" \-\-backend " NAME"
+Select a backend
+.RB ( container " or " vm ).
+A backend below the isolation floor is never selected.
 .TP
 .BI \-\-min\-isolation " TIER"
-Raise the isolation floor for this invocation. May raise, never lowers.
+Raise the isolation floor for this invocation. May raise but never lower;
+lowering requires
+.BR \-\-force\-isolation .
 .TP
 .BI \-\-force\-isolation " TIER"
-Lower the floor deliberately. Recorded in the box's metadata, surfaced by
-.BR status " and " ls ,
-and warned about on every invocation of the resulting box.
+Run below the project's declared isolation floor. Recorded in the box's
+metadata and warned about on every subsequent invocation.
 .TP
-.BR \-e ", " \-\-env " \fIKEY=VAL\fR"
-Set a variable for this invocation (repeatable).
+.BI \-e " KEY=VAL" "\fR, \fP" \-\-env " KEY=VAL"
+Set an environment variable inside the box.
 .TP
-.BR \-E ", " \-\-env\-passthrough " \fIKEY\fR"
-Forward
-.I KEY
-from the caller's environment (repeatable).
+.BI \-E " KEY" "\fR, \fP" \-\-env\-passthrough " KEY"
+Forward a host environment variable into the box by name.
 .TP
 .BI \-\-network " MODE"
-Override
-.IR [network].mode :
-.BR none ", " proxy ", or " open .
-.TP
-.B \-\-offline
-Equivalent to
-.BR "\-\-network none" .
+Override the egress mode:
+.BR off ", " proxy ", or " open .
 .TP
 .B \-\-rebuild
 Rebuild the image before starting.
 .TP
 .B \-\-recreate
-Recreate the box before executing.
+Recreate the box from current configuration, keeping its persistent home.
 .TP
 .B \-\-root
-Execute as uid 0 in the guest. Under the container tier this is uid 0 with
-all capabilities dropped; see
-.BR agentbox-security (7).
+Run as uid 0 inside the box. Under the container tier this is uid 0 with
+every capability dropped, and masking then relies on the guest lacking
+CAP_SYS_ADMIN; agentbox warns when it applies.
+.IP
+Accepted after
+.B run
+and
+.B shell
+as well as before, but only ahead of the command:
+.B agentbox run \-\-root mytool
+runs mytool as root, while
+.B agentbox run mytool \-\-root
+passes
+.B \-\-root
+to mytool. Use
+.B \-\-
+to end agentbox's flags where the command's own first argument looks like
+one.
 .TP
 .B \-\-no\-mask
-Skip masking. Warns on stderr on every invocation.
+Disable secret masking for this invocation. Warns loudly. There is no
+configuration key for this: turning masking off should require saying so at
+the prompt, every time.
 .TP
 .B \-\-dry\-run
-Print the plan and generated artifacts; change nothing.
+Print the full plan and change nothing. Building a plan never creates or
+starts anything, so this is the same plan the enacting commands use.
 .TP
 .B \-\-json
-Machine-readable output where supported.
+Machine-readable output where supported. With
+.B \-\-dry\-run
+this is the inspection surface: it publishes the complete mask set, the
+resolved egress policy, and the selected backend.
 .TP
-.BR \-q ", " \-\-quiet " / " \-v ", " \-\-verbose
-Diagnostic verbosity.
+.BR \-q ", " \-\-quiet
+Suppress non-essential diagnostics.
 .TP
-.BI \-\-timeout " SECONDS"
-Startup wait budget (default 120).
-.SH BOX SELECTION
-Each project has a default box, initially the first created and changeable
-with
-.BR "agentbox default" .
-Bare
-.B agentbox
-in a project with no boxes creates one; with boxes, it attaches to the
-default; if the default was removed, it errors naming the available boxes
-rather than guessing.
-.B \-\-name
-addresses a specific box, creating it only when
-.B \-\-new
-is also given.
+.BR \-v ", " \-\-verbose
+Print additional diagnostics.
 .SH WORKSPACE DETECTION
-First match wins: the
-.B \-\-workspace
-flag; the
-.B AGENTBOX_WORKSPACE
-environment variable; the nearest ancestor containing
+The workspace root is the nearest ancestor directory containing a version
+control root or an
 .B agentbox.toml
-or
-.BR .agentbox.toml ;
-the nearest ancestor containing a VCS root marker
-.RB ( .git ", " .hg ", " .jj ", " .svn );
-the starting directory. The search stops at
-.B $HOME
-and at filesystem boundaries, and refuses to select
-.B /
-or
-.B $HOME
-itself.
-.SH STREAMS, SIGNALS, EXIT STATUS
-Diagnostics go to stderr; stdout belongs to the command in the box, so
-.B "agentbox cat build.json | jq ."
-works unchanged. A TTY is allocated only when both stdin and stdout are
-terminals.
-.BR SIGINT ", " SIGTERM ", " SIGQUIT ", and " SIGWINCH
-are forwarded to the process in the box.
+\(em searched upward from the current directory, or from
+.B \-C
+when given, and overridden entirely by
+.BR \-w .
+The resolved real path is what identifies the box, so two symlinks to one
+directory address the same box.
 .PP
-The in-box command's exit code is returned verbatim. agentbox's own
-failures use codes 64\(en78 per
-.BR sysexits.h :
+The working directory inside the box mirrors your shell's position within
+the workspace: running agentbox from a subdirectory lands you in the
+corresponding subdirectory under
+.BR [workspace].mount .
+.SH STREAMS, SIGNALS, EXIT STATUS
+Diagnostics go to
+.BR stderr .
+.B stdout
+belongs to the in-box command, so agentbox output never corrupts a pipeline.
+.PP
+Signals are forwarded to the in-box process, including SIGWINCH so terminal
+resizes propagate.
+.PP
+agentbox owns a small set of exit codes, per
+.BR sysexits.h ;
+any other status is the in-box command's, passed through verbatim.
+.TP
+.B 64
+Usage error.
 .TP
 .B 69
-No backend satisfies the isolation floor.
+No available backend satisfies the isolation floor. The diagnostic names
+what is missing.
 .TP
-.B 77
-The workspace configuration declares hooks or host mounts and is not
-trusted; see
-.BR trust .
+.B 70
+Internal error.
 .TP
 .B 78
-Configuration invalid, including backend-scope violations.
-.PP
-A command legitimately exiting 69 is indistinguishable from an unavailable
-backend; callers needing certainty should use
-.BR \-\-json ,
-which reports tool status and command status separately.
+Invalid configuration, including unknown keys and backend-scope violations.
 .SH FILES
 .TP
-.B agentbox.toml, .agentbox.toml
-Workspace configuration, at the workspace root. See
-.BR agentbox.toml (5).
+.B ./agentbox.toml
+Workspace configuration layer.
+.B .agentbox.toml
+is accepted as an alternative; having both is an error.
 .TP
-.B .agentignore
+.B ./.agentignore
 Mask patterns, gitignore syntax.
 .TP
 .B $XDG_CONFIG_HOME/agentbox/config.toml
-User configuration.
+User configuration layer.
 .TP
 .B $XDG_CONFIG_HOME/agentbox/agentignore
-User-global mask patterns.
+User-global mask patterns, applied to every project.
 .TP
-.B /etc/agentbox/config.toml
-System configuration.
+.B $XDG_STATE_HOME/agentbox/boxes/<key>/
+Per-box state: metadata, generated proxy configuration, logs.
 .TP
-.B $XDG_STATE_HOME/agentbox/projects/
-Per-project state: box metadata, generated artifacts, worktrees, locks,
-logs, trust records.
-.TP
-.B $XDG_CACHE_HOME/agentbox/
-Generated build contexts and image records.
+.B $XDG_CACHE_HOME/agentbox/build/
+Generated build contexts, keyed by feature digest.
 .SH SEE ALSO
 .BR agentbox.toml (5),
-.BR agentbox-security (7),
-.BR gitignore (5)
+.BR agentbox-security (7)

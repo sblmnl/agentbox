@@ -1,29 +1,28 @@
 package app
 
 import (
-	"bytes"
-	"fmt"
 	"os"
 	"path/filepath"
-
-	"github.com/BurntSushi/toml"
-	"github.com/sblmnl/agentbox/internal/netpol"
 )
 
-// CmdInit scaffolds agentbox.toml and .agentignore. Only init and
-// allow ever write to the workspace, and only on explicit invocation.
-func (c *Ctx) CmdInit(profile string) error {
+// CmdInit scaffolds agentbox.toml and .agentignore. It is the only command
+// that writes to the workspace, and only on explicit invocation.
+func (c *Ctx) CmdInit() error {
 	cfgPath := filepath.Join(c.Workspace, "agentbox.toml")
 	if _, err := os.Stat(cfgPath); err == nil {
 		return Usagef("%s already exists", cfgPath)
 	}
-	profileBlock := ""
-	if profile != "" {
-		profileBlock = fmt.Sprintf("\n[box]\nprofile = %q\n", profile)
-	}
-	cfg := fmt.Sprintf(`# agentbox project configuration — see agentbox.toml(5)
+	cfg := `# agentbox project configuration — see agentbox.toml(5)
 version = 1
-%s
+
+[agents]
+# Installs the agent's binary into the image. This and the "agent:*" entry in
+# [network].bundles below are a pair: one puts the tool in the box, the other
+# lets it reach its own endpoints. Removing one without the other gives you a
+# box that either cannot run the agent or cannot let it talk.
+install = ["claude-code"]
+channel = "stable"
+
 [toolchains]
 # dotnet = "10"
 # node   = "24"
@@ -36,7 +35,7 @@ allow   = []
 
 [security]
 min_isolation = "container"
-`, profileBlock)
+`
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		return Softwaref("%v", err)
 	}
@@ -64,69 +63,6 @@ secrets/
 		c.Notef("wrote %s", ignorePath)
 	}
 	c.Notef("wrote %s", cfgPath)
-	c.Notef("next: `agentbox doctor` to preflight, `agentbox config` to see the effective merge")
-	return nil
-}
-
-// CmdAllow appends domains to the workspace config's allowlist.
-func (c *Ctx) CmdAllow(domains []string) error {
-	if len(domains) == 0 {
-		return Usagef("allow requires at least one domain")
-	}
-	pol, err := netpol.Resolve("proxy", nil, domains, nil)
-	if err != nil {
-		return Configf("%v", err)
-	}
-	_ = pol
-
-	cfgPath := filepath.Join(c.Workspace, "agentbox.toml")
-	alt := filepath.Join(c.Workspace, ".agentbox.toml")
-	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		if _, err := os.Stat(alt); err == nil {
-			cfgPath = alt
-		}
-	}
-
-	var tree map[string]any
-	if data, err := os.ReadFile(cfgPath); err == nil {
-		if err := toml.Unmarshal(data, &tree); err != nil {
-			return Configf("%s: %v", cfgPath, err)
-		}
-	} else {
-		tree = map[string]any{"version": int64(1)}
-	}
-	network, _ := tree["network"].(map[string]any)
-	if network == nil {
-		network = map[string]any{}
-		tree["network"] = network
-	}
-	existing, _ := network["allow"].([]any)
-	seen := map[string]bool{}
-	for _, e := range existing {
-		if s, ok := e.(string); ok {
-			seen[s] = true
-		}
-	}
-	added := 0
-	for _, d := range domains {
-		if !seen[d] {
-			existing = append(existing, d)
-			seen[d] = true
-			added++
-		}
-	}
-	network["allow"] = existing
-
-	var buf bytes.Buffer
-	buf.WriteString("# rewritten by `agentbox allow`; comments are not preserved\n")
-	if err := toml.NewEncoder(&buf).Encode(tree); err != nil {
-		return Softwaref("%v", err)
-	}
-	if err := os.WriteFile(cfgPath, buf.Bytes(), 0o644); err != nil {
-		return Softwaref("%v", err)
-	}
-	// The user asked for this edit; do not invalidate their recorded trust.
-	c.refreshTrustAfterRewrite()
-	c.Notef("added %d domain(s) to %s", added, cfgPath)
+	c.Notef("next: `agentbox config` to see the effective merge, `agentbox --dry-run` to see the plan")
 	return nil
 }

@@ -2,13 +2,10 @@ GO      ?= go
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PREFIX  ?= /usr/local
 
-.PHONY: all build test test-privileged fmt-check vet man-lint completions clean install
+.PHONY: all build test test-privileged fmt-check vet man-lint clean install
 
 all: fmt-check vet build test
 
-# CGO_ENABLED=0 is load-bearing, not tidiness: under the vm tier this same
-# binary is bind-mounted into the box and run there as the egress forwarder,
-# so it must not depend on the host's libc.
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath ./cmd/agentbox
 
@@ -35,12 +32,6 @@ man-lint:
 		else echo "skipping $$m (no mandoc/groff)"; fi; \
 	done
 
-completions: build
-	mkdir -p completions
-	./agentbox completion bash 2>/dev/null > completions/agentbox.bash
-	./agentbox completion zsh  2>/dev/null > completions/_agentbox
-	./agentbox completion fish 2>/dev/null > completions/agentbox.fish
-
 install: build
 	install -Dm755 agentbox $(DESTDIR)$(PREFIX)/bin/agentbox
 	install -Dm644 docs/man/agentbox.1 $(DESTDIR)$(PREFIX)/share/man/man1/agentbox.1
@@ -48,4 +39,4 @@ install: build
 	install -Dm644 docs/man/agentbox-security.7 $(DESTDIR)$(PREFIX)/share/man/man7/agentbox-security.7
 
 clean:
-	rm -rf agentbox dist completions
+	rm -rf agentbox dist

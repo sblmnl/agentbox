@@ -18,19 +18,35 @@ import (
 type Merged struct {
 	Tree   map[string]any
 	Origin map[string]string // dotted key -> layer name
+	// History records every scalar contribution in application order. The
+	// merge itself is last-writer-wins, but a workspace config is committed
+	// by whoever wrote the repository rather than by the person running
+	// agentbox, so we have to be able to answer "what did the user ask for
+	// before the workspace overrode it?" -- see WeakenedByWorkspace.
+	History map[string][]Contribution
+}
+
+// Contribution is one layer's scalar value for one key.
+type Contribution struct {
+	Layer string
+	Value any
 }
 
 func NewMerged() *Merged {
-	return &Merged{Tree: map[string]any{}, Origin: map[string]string{}}
+	return &Merged{
+		Tree:    map[string]any{},
+		Origin:  map[string]string{},
+		History: map[string][]Contribution{},
+	}
 }
 
 // Apply merges layer (already schema-validated) into m, attributing values
 // to layerName.
 func (m *Merged) Apply(tree map[string]any, layerName string) {
-	mergeTables(m.Tree, tree, "", layerName, m.Origin)
+	mergeTables(m.Tree, tree, "", layerName, m.Origin, m.History)
 }
 
-func mergeTables(dst, src map[string]any, prefix, layer string, origin map[string]string) {
+func mergeTables(dst, src map[string]any, prefix, layer string, origin map[string]string, history map[string][]Contribution) {
 	for k, v := range src {
 		path := k
 		if prefix != "" {
@@ -39,10 +55,10 @@ func mergeTables(dst, src map[string]any, prefix, layer string, origin map[strin
 		switch sv := v.(type) {
 		case map[string]any:
 			if dv, ok := dst[k].(map[string]any); ok {
-				mergeTables(dv, sv, path, layer, origin)
+				mergeTables(dv, sv, path, layer, origin, history)
 			} else {
 				fresh := map[string]any{}
-				mergeTables(fresh, sv, path, layer, origin)
+				mergeTables(fresh, sv, path, layer, origin, history)
 				dst[k] = fresh
 			}
 		case []any:
@@ -66,6 +82,7 @@ func mergeTables(dst, src map[string]any, prefix, layer string, origin map[strin
 		default:
 			dst[k] = v
 			origin[path] = layer
+			history[path] = append(history[path], Contribution{Layer: layer, Value: v})
 		}
 	}
 }

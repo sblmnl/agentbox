@@ -9,13 +9,13 @@ breaks a bound it claims to enforce is a vulnerability, including:
   `.agentignore` rules) from inside a box.
 - **Egress** reaching a destination outside the effective allowlist in
   `proxy` mode, or any traffic bypassing the proxy topology.
-- A box reaching another box's network endpoint, persistent home, tree
-  (outside `shared` mode), or mask view.
+- A box reaching another box's network endpoint, persistent home, tree, or
+  mask view.
 - Escaping the workspace tree, or writing to the host outside the
   workspace and agentbox's own state directories.
-- Executing `[hooks]` or materializing `[[workspace.mounts]]` from a
-  workspace config that has **not** been trusted, or defeating trust
-  invalidation.
+- A workspace config weakening a ranked security key (isolation floor,
+  egress mode, mask mode, ...) **without** the per-invocation warning that
+  names it.
 - Silent isolation-floor downgrade, or any path where a weaker guarantee is
   substituted without an error or a per-invocation warning.
 

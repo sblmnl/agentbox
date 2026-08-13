@@ -1,8 +1,7 @@
 package backend
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"bufio"
 	"errors"
 	"fmt"
 	"net"
@@ -18,43 +17,37 @@ import (
 	"github.com/sblmnl/agentbox/internal/share"
 )
 
-// VMBackend provides the vm tier on an OCI-consuming VM runtime — Kata
-// Containers — driven through a container engine CLI. The image pipeline, the
-// configuration model, and the mask generator are exactly the ones the
-// container backend uses; what changes is the runtime handed to the engine,
-// the share construction, and the proxy topology.
-//
-// Nothing here is Kata-specific by design; krun is refused a tier up, at
-// selection (see krunRefusal), because it cannot be entered at all.
+// VMBackend provides the vm tier: Kata Containers driven through Docker. The
+// image pipeline, the configuration model, the mask generator and the egress
+// policy are exactly the ones the container backend uses; what changes is the
+// runtime handed to the engine and the construction of the share.
 type VMBackend struct {
-	EngineBin string // "docker" or "podman"
+	EngineBin string // "docker"
 	VMRuntime string // engine runtime name: "kata", "kata-qemu", "kata-clh"
-	StateRoot string // agentbox state root: proxyd spool and share views live here
-	SelfExe   string // binary spawned as the proxyd daemon (normally os.Executable)
+	StateRoot string // agentbox state root: share views live here
 
 	Runner func(args ...string) *exec.Cmd
 	Warnf  func(format string, a ...any)
 
 	// canMountView is a test seam over mask.CanApplyMounts.
 	canMountView func() bool
-	// waitReady is a test seam over netpol.WaitVsockReady: binding a vsock
-	// socket depends on host kernel modules, which unit tests must not need.
-	waitReady func(stateRoot string, timeout time.Duration) error
-	// probeGrace is how long probeProxyReach keeps retrying a refused
-	// connection while the in-guest forwarder binds. Zero disables the wait.
+	// hostResolvers is a test seam over the host's upstream nameservers.
+	hostResolvers func() ([]string, error)
+	// probeGrace is how long probeProxyReach keeps retrying while the sidecar
+	// finishes binding. Zero disables the wait.
 	probeGrace time.Duration
 }
 
-func NewVMBackend(engineBin, vmRuntime, stateRoot string) *VMBackend {
-	v := &VMBackend{EngineBin: engineBin, VMRuntime: vmRuntime, StateRoot: stateRoot}
+// NewVMBackend builds the vm backend from a probed "<engine>/<runtime>"
+// record (see detectVMRuntime).
+func NewVMBackend(probedRuntime, stateRoot string) *VMBackend {
+	engineBin, runtimeName := SplitVMRuntime(probedRuntime)
+	v := &VMBackend{EngineBin: engineBin, VMRuntime: runtimeName, StateRoot: stateRoot}
 	v.Runner = func(args ...string) *exec.Cmd { return exec.Command(engineBin, args...) }
 	v.Warnf = func(format string, a ...any) { fmt.Fprintf(os.Stderr, "warning: "+format+"\n", a...) }
 	v.canMountView = mask.CanApplyMounts
-	v.waitReady = netpol.WaitVsockReady
+	v.hostResolvers = hostUpstreamResolvers
 	v.probeGrace = 15 * time.Second
-	if exe, err := os.Executable(); err == nil {
-		v.SelfExe = exe
-	}
 	return v
 }
 
@@ -83,9 +76,6 @@ func (v *VMBackend) PrepareRootfs(*BoxSpec) error { return nil }
 
 // ViewsDir holds every box's host-side mask view, and ViewRoot is one box's,
 // keyed by resource name so Remove can find it with nothing but the name.
-// Both are exported because a view is also an artifact the inspection and
-// prune paths have to locate, and a second copy of this path that drifted
-// would leave a mounted view nobody could name.
 func ViewsDir(stateRoot string) string { return filepath.Join(stateRoot, "views") }
 
 func ViewRoot(stateRoot, resourceName string) string {
@@ -123,7 +113,11 @@ func (v *VMBackend) SetupShare(spec *BoxSpec) error {
 			return nil
 		}
 		view := v.viewRoot(spec.ResourceName)
-		err := share.EnsureDaemon(v.StateRoot, v.SelfExe, &share.DaemonSpec{
+		exe, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("locating the agentbox binary to run as the share daemon: %w", err)
+		}
+		err = share.EnsureDaemon(v.StateRoot, exe, &share.DaemonSpec{
 			Resource:   spec.ResourceName,
 			TreeRoot:   spec.TreeRoot,
 			Mountpoint: view,
@@ -169,32 +163,126 @@ func (v *VMBackend) SetupShare(spec *BoxSpec) error {
 	return nil
 }
 
-// CreateNetwork creates the box's internal bridge. Under this tier the
-// bridge carries no egress at all — that leaves over vsock — so its only job
-// is separation: an --internal network per box means no route off the
-// bridge and no box adjacent to another. There is no egress network and no
-// sidecar.
+// CreateNetwork builds the box's network topology, which is the container
+// tier's: a per-box bridge the guest sits on, and -- in proxy mode -- an
+// egress network only the proxy sidecar joins. The guest's only route out is
+// therefore through a proxy enforcing the allowlist, and a tool that ignores
+// HTTPS_PROXY fails closed rather than reaching the internet.
 //
-// Egress deliberately does not run over the bridge. A VM guest's path to a
-// host process crosses the host's INPUT policy and any VPN kill-switch that
-// filters by source address, neither of which the container engine knows
-// about; the observed failure is a healthy-looking box where every network
-// call hangs. vsock has no address to filter (see netpol/vsock.go).
+// A Kata guest talks to its sidecar over an ordinary bridge, which was worth
+// establishing rather than assuming: it does work, but Docker's embedded DNS
+// resolver does not. Docker publishes it at 127.0.0.11 inside the network
+// namespace, and a VM guest's loopback is its own, so nothing in the box can
+// reach it and container names do not resolve. Everything below follows from
+// that: the sidecar is addressed by a pinned IP rather than by name, and open
+// mode carries its own resolv.conf.
 //
-// The subnet and gateway are set explicitly, unlike the container tier,
-// purely so a box never lands on a subnet the engine or another box already
-// holds; 100.64.0.0/10 (RFC 6598) is carved for exactly this kind of
-// second-layer use and steers clear of host LANs. Note that on an
-// --internal network the engine blanks the *endpoint* gateway whatever
-// --gateway says, so the guest has no default route — with egress on vsock
-// and nothing to reach off the bridge, it needs none.
+// The subnet is allocated explicitly so a box never lands on one the engine
+// or another box already holds. 100.64.0.0/10 (RFC 6598) is carved for
+// exactly this kind of second-layer use and steers clear of host LANs.
 func (v *VMBackend) CreateNetwork(spec *BoxSpec) error {
-	subnet, gateway, err := v.allocateSubnet()
+	proxyMode := spec.Policy != nil && spec.Policy.Mode == netpol.ModeProxy
+	openMode := spec.Policy != nil && spec.Policy.Mode == netpol.ModeOpen
+
+	// Allocation reads the engine's network list and then creates a network,
+	// which is a check-then-act against state agentbox does not own. Two boxes
+	// coming up at the same moment -- different workspaces, so no shared
+	// agentbox lock serializes them -- can survey the same free /24 and both
+	// try to claim it. The engine rejects the loser, so retry: re-surveying
+	// after a failure is what makes the winner visible.
+	var subnet, gateway string
+	var err error
+	tried := map[string]bool{}
+	for attempt := 0; ; attempt++ {
+		subnet, gateway, err = v.allocateSubnet(tried)
+		if err != nil {
+			return err
+		}
+		tried[subnet] = true
+		args := []string{"network", "create", "--subnet", subnet, "--gateway", gateway}
+		if !openMode {
+			// Only open mode gets a route off the bridge.
+			args = append(args, "--internal")
+		}
+		err = v.run(append(args, spec.ResourceName+"-int")...)
+		if err == nil {
+			break
+		}
+		if attempt >= 4 {
+			return fmt.Errorf("could not allocate a free subnet for the box bridge after %d attempts: %w", attempt+1, err)
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	// Pin the sidecar at .2 (the engine holds .1 as the gateway) so the proxy
+	// address baked into the guest's environment at create time stays correct
+	// across restarts, with no lookup and no DNS.
+	addr, err := proxyAddrIn(subnet)
 	if err != nil {
 		return err
 	}
-	return v.run("network", "create", "--internal",
-		"--subnet", subnet, "--gateway", gateway, spec.ResourceName+"-int")
+	spec.ProxyAddr = addr
+	if proxyMode {
+		return v.run("network", "create", spec.ResourceName+"-egress")
+	}
+	return nil
+}
+
+// proxyAddrIn returns the address the sidecar is pinned to within a box
+// bridge's subnet: host .2, because the engine holds .1 as the gateway.
+//
+// One implementation, shared by the path that allocates the subnet and the
+// path that recovers it from an existing network. Two would be free to
+// disagree, and a disagreement here is a box whose baked-in HTTPS_PROXY
+// points at an address nothing is listening on.
+func proxyAddrIn(cidr string) (string, error) {
+	_, n, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return "", fmt.Errorf("box bridge subnet %q is not a CIDR: %w", cidr, err)
+	}
+	ip4 := n.IP.To4()
+	if ip4 == nil {
+		return "", fmt.Errorf("box bridge subnet %q is not IPv4", cidr)
+	}
+	addr := net.IPv4(ip4[0], ip4[1], ip4[2], ip4[3]+2)
+	if !n.Contains(addr) {
+		return "", fmt.Errorf("box bridge subnet %q is too small to hold a pinned proxy address", cidr)
+	}
+	return addr.String(), nil
+}
+
+// resolveProxyAddr fills in spec.ProxyAddr when the caller did not create the
+// network on this invocation.
+//
+// CreateNetwork is the only place the address is assigned, and ensureUp calls
+// it only when the box is absent from the runtime. Every restart of an
+// existing box therefore reaches Start with an empty ProxyAddr, and an empty
+// one is silently destructive twice over: createProxySidecar omits --ip and
+// lets the engine place the sidecar anywhere, while the guest's HTTPS_PROXY
+// was baked at create time and still names <subnet>.2 -- a box with a running
+// proxy it can never dial, whose every network call hangs with no error. The
+// reachability probe, meanwhile, dials /dev/tcp//3128 and reports a healthy
+// box as unreachable after burning the full probe grace.
+//
+// The bridge itself is the authority, so read it back rather than persisting
+// a second copy that could drift from the network it describes.
+func (v *VMBackend) resolveProxyAddr(spec *BoxSpec) error {
+	if spec.ProxyAddr != "" {
+		return nil
+	}
+	bridge := spec.ResourceName + "-int"
+	out, err := engineOutput(v.Runner, "network", "inspect", "--format", v.subnetInspectFormat(), bridge)
+	if err != nil {
+		return fmt.Errorf("cannot determine the proxy address for box %s: its bridge %s could not be inspected: %w",
+			spec.ResourceName, bridge, err)
+	}
+	for _, field := range strings.Fields(out) {
+		if addr, err := proxyAddrIn(field); err == nil {
+			spec.ProxyAddr = addr
+			return nil
+		}
+	}
+	return fmt.Errorf("cannot determine the proxy address for box %s: its bridge %s reports no usable IPv4 subnet",
+		spec.ResourceName, bridge)
 }
 
 // subnetInspectFormat is the engine-specific template listing a network's
@@ -229,12 +317,13 @@ func (v *VMBackend) usedSubnets() ([]*net.IPNet, error) {
 	return used, nil
 }
 
-// allocateSubnet picks a free /24 for a box bridge and its .1 gateway — the
-// address proxyd binds and the guest routes through. It carves from
-// 100.64.0.0/10 (RFC 6598 shared address space): reserved for exactly this
-// second-layer-of-NAT use, so it steers clear of both host LANs and the
-// engine's own default pools, and of any subnet already in use.
-func (v *VMBackend) allocateSubnet() (subnet, gateway string, err error) {
+// allocateSubnet picks a free /24 for a box bridge and its .1 gateway.
+//
+// skip holds subnets this call already tried and lost. Excluding them is what
+// makes the retry terminate: re-surveying is not enough on its own, because
+// the survey can still be reporting the moment before the winner's network
+// appeared, and we would pick the same address forever.
+func (v *VMBackend) allocateSubnet(skip map[string]bool) (subnet, gateway string, err error) {
 	used, err := v.usedSubnets()
 	if err != nil {
 		return "", "", err
@@ -242,9 +331,13 @@ func (v *VMBackend) allocateSubnet() (subnet, gateway string, err error) {
 	for a := 64; a < 128; a++ {
 		for b := 0; b < 256; b++ {
 			base := fmt.Sprintf("100.%d.%d.0", a, b)
-			_, cand, _ := net.ParseCIDR(base + "/24")
+			cidr := base + "/24"
+			if skip[cidr] {
+				continue
+			}
+			_, cand, _ := net.ParseCIDR(cidr)
 			if !overlapsAny(cand, used) {
-				return base + "/24", fmt.Sprintf("100.%d.%d.1", a, b), nil
+				return cidr, fmt.Sprintf("100.%d.%d.1", a, b), nil
 			}
 		}
 	}
@@ -260,46 +353,66 @@ func overlapsAny(c *net.IPNet, used []*net.IPNet) bool {
 	return false
 }
 
-// guestHelperPath is where the agentbox binary is bind-mounted inside the
-// box, to be run as the in-guest end of the vsock egress path. It is the
-// same binary the host runs: the vm tier already requires host and guest to
-// share an architecture, and one binary means the forwarder cannot drift
-// from the daemon it speaks to.
-const guestHelperPath = "/usr/local/lib/agentbox/agentbox"
-
-// vsockToken returns the box's egress token, minting it on first use.
+// hostUpstreamResolvers returns the host's real upstream nameservers.
 //
-// The token is what tells the shared host listener which box a connection
-// belongs to, so it must survive restarts: the value was baked into the
-// box's environment at create time, and a fresh one would leave the guest
-// announcing a token no listener claims. It lives in the box state
-// directory at 0600 rather than in box metadata because it is a secret,
-// not a descriptor — nothing should print it.
-func (v *VMBackend) vsockToken(spec *BoxSpec) (string, error) {
-	path := filepath.Join(spec.StateDir, "vsock-token")
-	if blob, err := os.ReadFile(path); err == nil {
-		if tok := strings.TrimSpace(string(blob)); tok != "" {
-			return tok, nil
+// Loopback entries are skipped: a stub resolver like systemd-resolved's
+// 127.0.0.53 is reachable only from the host's own network namespace, which
+// is precisely what a VM guest does not share. systemd's own
+// /run/systemd/resolve/resolv.conf records the real upstreams behind the
+// stub, so it is consulted first where it exists.
+func hostUpstreamResolvers() ([]string, error) {
+	for _, path := range []string{"/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"} {
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		var out []string
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			fields := strings.Fields(sc.Text())
+			if len(fields) < 2 || fields[0] != "nameserver" {
+				continue
+			}
+			if ip := net.ParseIP(fields[1]); ip != nil && !ip.IsLoopback() {
+				out = append(out, fields[1])
+			}
+		}
+		f.Close()
+		if len(out) > 0 {
+			return out, nil
 		}
 	}
-	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("minting vsock token: %w", err)
+	return nil, errors.New("no non-loopback nameserver found in /run/systemd/resolve/resolv.conf or /etc/resolv.conf")
+}
+
+// writeGuestResolvConf generates the resolv.conf bind-mounted into an
+// open-mode guest, because Docker's embedded resolver cannot be reached from
+// a VM. Note that --dns does not help: on a user-defined network the engine
+// still writes 127.0.0.11 into the container's resolv.conf and merely points
+// the embedded resolver's upstream at the given address.
+func (v *VMBackend) writeGuestResolvConf(spec *BoxSpec) (string, error) {
+	servers, err := v.hostResolvers()
+	if err != nil {
+		return "", fmt.Errorf("network mode \"open\" under the vm tier needs the host's upstream nameservers, "+
+			"because a VM guest cannot reach the engine's embedded resolver: %w", err)
 	}
-	tok := hex.EncodeToString(buf)
+	var b strings.Builder
+	b.WriteString("# generated by agentbox: the engine's embedded resolver is unreachable from a VM guest\n")
+	for _, s := range servers {
+		fmt.Fprintf(&b, "nameserver %s\n", s)
+	}
 	if err := os.MkdirAll(spec.StateDir, 0o700); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, []byte(tok+"\n"), 0o600); err != nil {
-		return "", fmt.Errorf("storing vsock token: %w", err)
+	path := filepath.Join(spec.StateDir, "resolv.conf")
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		return "", err
 	}
-	return tok, nil
+	return path, nil
 }
 
 // CreatePersistentState creates the box's persistent home, seeded
-// from the image on first creation. It is engine-managed; under Kata the
-// runtime attaches it to the guest, giving the disk-image-backed semantics
-// this tier requires.
+// from the image on first creation.
 func (v *VMBackend) CreatePersistentState(spec *BoxSpec) error {
 	return v.run("volume", "create", spec.ResourceName+"-home")
 }
@@ -330,9 +443,9 @@ func (v *VMBackend) Create(spec *BoxSpec) error {
 		args = append(args, "--annotation", "io.katacontainers.config.hypervisor.enable_mem_prealloc=true")
 	}
 	if spec.NestedDocker {
-		// a nested container engine is permitted at this tier because
-		// it is guest-local. The engine flag is confined to the guest by the
-		// VM runtime (Kata: privileged_without_host_devices).
+		// A nested container engine is permitted at this tier because it is
+		// guest-local. The engine flag is confined to the guest by the VM
+		// runtime (Kata: privileged_without_host_devices).
 		args = append(args, "--privileged")
 	}
 
@@ -363,29 +476,21 @@ func (v *VMBackend) Create(spec *BoxSpec) error {
 		}
 	}
 
-	// Egress leaves the box over vsock, not over the bridge, so the proxy
-	// variables point at loopback: the in-guest forwarder listens there and
-	// carries the bytes to the host daemon. Loopback is also the only
-	// address that cannot be reached from another box.
-	command := []string{"sleep", "infinity"}
-	if spec.Policy != nil && spec.Policy.Mode == netpol.ModeProxy {
-		token, err := v.vsockToken(spec)
+	switch {
+	case spec.Policy != nil && spec.Policy.Mode == netpol.ModeProxy:
+		// The proxy is addressed by IP: container-name DNS does not resolve
+		// from a VM guest. In proxy mode the guest needs no resolver at all --
+		// squid resolves on its behalf, which also means the box has no DNS
+		// channel of its own to leak through.
+		spec.ProxyEnv = netpol.ProxyEnv(fmt.Sprintf("http://%s:3128", spec.ProxyAddr))
+	case spec.Policy != nil && spec.Policy.Mode == netpol.ModeOpen:
+		path, err := v.writeGuestResolvConf(spec)
 		if err != nil {
 			return err
 		}
-		if v.SelfExe == "" {
-			return fmt.Errorf("cannot locate the agentbox binary to run as the box's egress forwarder")
-		}
-		args = append(args,
-			"--mount", "type=bind,src="+v.SelfExe+",dst="+guestHelperPath+",readonly",
-			"-e", "AGENTBOX_VSOCK_TOKEN="+token)
-		spec.ProxyEnv = netpol.ProxyEnv(fmt.Sprintf("http://127.0.0.1:%d", netpol.VsockPort))
-		// The forwarder is supervised by the box's own init process: if it
-		// dies the box keeps running with no egress, which would look like
-		// a hung agent, so it is restarted rather than left down.
-		command = []string{"sh", "-c",
-			"while :; do " + guestHelperPath + " vsockfwd; sleep 1; done & exec sleep infinity"}
+		args = append(args, "--mount", "type=bind,src="+path+",dst=/etc/resolv.conf,readonly")
 	}
+
 	for k, val := range spec.Env {
 		args = append(args, "-e", k+"="+val)
 	}
@@ -393,9 +498,15 @@ func (v *VMBackend) Create(spec *BoxSpec) error {
 		args = append(args, "-e", k+"="+val)
 	}
 
-	args = append(args, spec.ImageRef)
-	args = append(args, command...)
-	return v.run(args...)
+	args = append(args, spec.ImageRef, "sleep", "infinity")
+	if err := v.run(args...); err != nil {
+		return err
+	}
+
+	if spec.Policy != nil && spec.Policy.Mode == netpol.ModeProxy {
+		return createProxySidecar(v.Runner, v.EngineBin, spec)
+	}
+	return nil
 }
 
 // Start brings the box up, proxy first: a running guest behind a
@@ -417,7 +528,17 @@ func (v *VMBackend) Start(spec *BoxSpec) error {
 		}
 	}
 	if spec.Policy != nil && spec.Policy.Mode == netpol.ModeProxy {
-		if err := v.ensureProxyListener(spec); err != nil {
+		// Before anything touches the sidecar: on a restart CreateNetwork did
+		// not run, so the pinned address has to be recovered from the bridge.
+		// Refusing here is deliberate -- proceeding would produce an
+		// unreachable proxy that reports no error at all.
+		if err := v.resolveProxyAddr(spec); err != nil {
+			return err
+		}
+		if err := ensureSidecarExists(v.Runner, v.EngineBin, spec); err != nil {
+			return err
+		}
+		if err := v.run("start", spec.ResourceName+"-proxy"); err != nil {
 			return err
 		}
 	}
@@ -428,7 +549,7 @@ func (v *VMBackend) Start(spec *BoxSpec) error {
 		return err
 	}
 	if spec.Policy != nil && spec.Policy.Mode == netpol.ModeProxy {
-		return v.probeProxyReach(spec)
+		v.probeProxyReach(spec)
 	}
 	return nil
 }
@@ -469,145 +590,63 @@ func (v *VMBackend) logTail(name string) string {
 // probeProxyReach checks, from inside the started guest, that the box can
 // actually open a connection to its proxy.
 //
-// ensureProxyListener only proves the daemon bound its vsock socket on the
-// *host*. What it cannot prove is that the in-guest forwarder came up and
-// reached it: the binary mount could have failed, the guest could lack the
-// vsock transport, or the forwarder could be crash-looping. In every one of
-// those cases the engine reports a perfectly healthy box and every network
-// call inside it hangs until it times out, which reads like a hung agent
-// rather than a broken egress path. Turning that into one named error at
-// start is the whole point of the probe.
-//
-// A probe that cannot run (no curl in a user-supplied image) is not evidence
-// of a broken path and must not fail the box; only an actual connect failure
-// is treated as one. That exemption is deliberately narrow: it covers a
-// missing tool *inside* a guest the engine did enter, and nothing else. An
-// engine that cannot run the probe at all — a box that died, an engine error,
-// a runtime whose exec is not implemented — leaves the check that exists to
-// catch silently-broken egress unable to run, and passing that off as success
-// would be a fail-open. It warns on every invocation instead.
-func (v *VMBackend) probeProxyReach(spec *BoxSpec) error {
-	addr := fmt.Sprintf("127.0.0.1:%d", netpol.VsockPort)
-	// The box has only just started; give its forwarder a moment to bind
-	// before treating a refusal as the answer.
+// It warns rather than failing: the policy is enforced at the sidecar, so an
+// unreachable proxy is a box with no egress, not a box with widened egress.
+// Failing closed here would let a transient engine hiccup take down work that
+// would otherwise have run. What it must not do is stay quiet — a box whose
+// every network call hangs is the most confusing failure this tier has.
+func (v *VMBackend) probeProxyReach(spec *BoxSpec) {
+	// bash, not sh: /dev/tcp is a bash builtin, and the box's /bin/sh is dash
+	// on a Debian-family base, where it is not a real path and the probe would
+	// report every healthy box as unreachable.
+	//
+	// exit 127 is "bash is not in this image" -- a custom [image].ref need not
+	// carry it. That is a probe we could not run, not a box that cannot reach
+	// its proxy, and the two must not produce the same message.
+	const probeMissing = 127
 	deadline := time.Now().Add(v.probeGrace)
-	var code string
 	for {
-		// Any HTTP status proves the path; only the connect must succeed.
-		cmd := v.Runner("exec", spec.ResourceName, "sh", "-c",
-			"command -v curl >/dev/null 2>&1 || exit 127; "+
-				"curl -s -o /dev/null -m 5 --noproxy '*' http://"+addr+"/; echo $?")
-		out, err := cmd.Output()
-		if err != nil {
-			var ee *exec.ExitError
-			if errors.As(err, &ee) && ee.ExitCode() == 127 {
-				// The guest ran the script and it found no curl: the probe
-				// could not run, which is not evidence of a broken path.
-				return nil
-			}
-			v.probeUnrunnableWarning(spec, err)
-			return nil
+		code, err := engineExecQuiet(v.Runner, spec.ResourceName, []string{
+			"bash", "-c", fmt.Sprintf("exec 3<>/dev/tcp/%s/3128", spec.ProxyAddr),
+		})
+		if err == nil && code == 0 {
+			return
 		}
-		code = strings.TrimSpace(string(out))
-		if code != "7" || time.Now().After(deadline) {
-			break
+		if time.Now().After(deadline) {
+			switch {
+			case err != nil || code == probeMissing:
+				v.Warnf("box %s: could not verify that it can reach its egress proxy at %s — the probe\n"+
+					"itself could not run (the image may have no bash). Egress policy is enforced at\n"+
+					"the proxy, so this is not a widened policy; what is unverified is whether the box\n"+
+					"has any working egress at all.", spec.ResourceName, spec.ProxyAddr)
+			default:
+				v.Warnf("box %s: cannot reach its egress proxy at %s:3128. The box is running but every\n"+
+					"network call from it will hang. `%s logs %s-proxy` shows why the sidecar is not\n"+
+					"answering.", spec.ResourceName, spec.ProxyAddr, v.EngineBin, spec.ResourceName)
+			}
+			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	switch code {
-	case "7", "28": // connection refused / timed out
-		return fmt.Errorf(
-			"box %s cannot reach its egress proxy on %s\n"+
-				"The host daemon bound its vsock socket, so what failed is inside the box:\n"+
-				"the forwarder that carries loopback to the host is not accepting.\n"+
-				"\n"+
-				"  * `agentbox logs` shows the forwarder's own errors; it is restarted in a\n"+
-				"    loop, so a persistent fault repeats there once a second.\n"+
-				"  * An \"exec format error\" means the mounted agentbox binary does not run in\n"+
-				"    the guest. Build it static — `CGO_ENABLED=0 go build ./cmd/agentbox` — as\n"+
-				"    a binary dynamically linked against the host's libc will not run there.\n"+
-				"  * A vsock connect failure means the runtime gave the box no vsock device.\n"+
-				"    Check that the host has /dev/vhost-vsock and that the VM runtime is\n"+
-				"    configured to attach one.\n"+
-				"\n"+
-				"proxyd log: %s",
-			spec.ResourceName, addr, netpol.LogPath(v.StateRoot))
-	}
-	return nil
 }
 
-// probeUnrunnableWarning reports that the egress path could not be verified.
-//
-// It is a warning rather than an error because the box may well be fine and
-// the probe is itself diagnostic: failing the box closed here would let a
-// transient engine hiccup take down work that would otherwise have run. What
-// it must not do is stay quiet — an unverified egress path is exactly the
-// condition the probe exists to surface.
-func (v *VMBackend) probeUnrunnableWarning(spec *BoxSpec, err error) {
-	detail := err.Error()
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		if msg := strings.TrimSpace(string(ee.Stderr)); msg != "" {
-			detail = msg
-		}
-	}
-	v.Warnf("box %s: could not verify that the box can reach its egress proxy — the engine\n"+
-		"could not run the probe in it. Egress policy is enforced by the host daemon, so\n"+
-		"this is not a widened policy; what is unverified is whether the box has any\n"+
-		"working egress at all, and a broken forwarder makes every network call inside\n"+
-		"the box hang. `agentbox logs` shows the forwarder's errors.\n"+
-		"engine: %s", spec.ResourceName, detail)
-}
-
-func (v *VMBackend) ensureProxyListener(spec *BoxSpec) error {
-	token, err := v.vsockToken(spec)
-	if err != nil {
-		return err
-	}
-	ls := &netpol.ListenerSpec{
-		BoxID:          spec.BoxID,
-		Resource:       spec.ResourceName,
-		Token:          token,
-		Mode:           spec.Policy.Mode,
-		Allow:          spec.Policy.Allow,
-		Deny:           spec.Policy.Deny,
-		Audit:          spec.Policy.Audit,
-		AuditPath:      filepath.Join(spec.StateDir, "logs", "proxy-access.log"),
-		ReadTimeout:    spec.ProxyReadTimeout,
-		RequestTimeout: spec.ProxyRequestTimeout,
-	}
-	if err := netpol.WriteListenerSpec(v.StateRoot, ls); err != nil {
-		return err
-	}
-	if err := netpol.EnsureDaemon(v.StateRoot, v.SelfExe); err != nil {
-		return err
-	}
-	// The daemon publishes readiness as a file: a host process cannot dial
-	// its own CID_ANY vsock socket to test it the way it dialed a bridge
-	// gateway.
-	if err := v.waitReady(v.StateRoot, 30*time.Second); err != nil {
-		return fmt.Errorf("%w\nproxyd log: %s", err, netpol.LogPath(v.StateRoot))
-	}
-	return nil
-}
-
-// Stop halts the guest and retracts its proxy listener. Stopping a VM box
-// returns its memory to the host; leaving the listener bound
-// would hold a gateway address the engine may reuse.
+// Stop halts the guest and its proxy. Stopping a VM box returns its memory to
+// the host.
 func (v *VMBackend) Stop(name string) error {
+	_ = v.run("stop", "--time", "10", name+"-proxy")
 	err := v.run("stop", "--time", "10", name)
-	_ = netpol.RemoveListenerSpec(v.StateRoot, name)
 	// Retract the box's share daemon; a no-op for view-mode boxes.
 	_ = share.Teardown(v.StateRoot, name, v.viewRoot(name))
 	return err
 }
 
 func (v *VMBackend) Remove(name string, keepState bool) error {
-	_ = netpol.RemoveListenerSpec(v.StateRoot, name)
+	_ = v.run("rm", "-f", name+"-proxy")
 	if err := v.run("rm", "-f", name); err != nil {
 		return err
 	}
 	_ = v.run("network", "rm", name+"-int")
+	_ = v.run("network", "rm", name+"-egress")
 	if err := share.Teardown(v.StateRoot, name, v.viewRoot(name)); err != nil {
 		return err
 	}
@@ -628,21 +667,26 @@ func (v *VMBackend) Inspect(name string) (State, error) {
 	return engineInspect(v.Runner, v.EngineBin, name)
 }
 
-// Logs streams guest logs from the engine. Proxy logs are not an engine
-// artifact under this tier — they are the audit file the host daemon
-// writes — and the caller (CmdLogs) reads that file directly, where it also
-// works for a stopped box.
 func (v *VMBackend) Logs(name string, proxy bool, follow bool) error {
+	target := name
 	if proxy {
-		return fmt.Errorf("vm proxy logs live in the box state directory (logs/proxy-access.log); use `agentbox logs --proxy`")
+		target = name + "-proxy"
 	}
 	args := []string{"logs"}
 	if follow {
 		args = append(args, "-f")
 	}
-	args = append(args, name)
+	args = append(args, target)
 	cmd := v.Runner(args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func (v *VMBackend) ProxyLogCmd(name string, follow bool) *exec.Cmd {
+	return proxyLogCmd(v.Runner, name, follow)
+}
+
+func (v *VMBackend) RemoveImage(ref string) error {
+	return v.run("image", "rm", ref)
 }

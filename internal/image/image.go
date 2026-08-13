@@ -310,6 +310,21 @@ func writeToolchain(w func(string, ...any), name, version string) {
 	w("")
 }
 
+// AgentForCommand maps the command a user types to the [agents].install entry
+// that provides it. It exists so that "the file claude was not found" can be
+// answered with the one line that fixes it: the two names differ, and
+// `[network].bundles = ["agent:claude-code"]` -- which only opens egress --
+// looks near enough to `[agents].install = ["claude-code"]` to be mistaken
+// for it.
+func AgentForCommand(cmd string) (string, bool) {
+	agent, ok := agentCommands[cmd]
+	return agent, ok
+}
+
+var agentCommands = map[string]string{
+	"claude": "claude-code",
+}
+
 func writeAgent(w func(string, ...any), agent, channel string) {
 	switch agent {
 	case "claude-code":

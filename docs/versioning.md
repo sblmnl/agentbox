@@ -21,8 +21,8 @@ configuration*, in these surfaces:
 
 | Surface | What's promised | Canonical source of truth |
 |---|---|---|
-| **Subcommands** | The set of reserved subcommands and what each does. Adding one is breaking — it reinterprets a bare word that previously ran *in the box* as an agentbox command. | `completionCommands` (`internal/app/completion.go`); `reserved` (`cmd/agentbox/main.go`) |
-| **Flags** | Global and per-command flags: their names, arity, and meaning. | flag parser (`cmd/agentbox/main.go`), completion tables |
+| **Subcommands** | The set of reserved subcommands and what each does. Adding one is breaking — it reinterprets a bare word that previously ran *in the box* as an agentbox command. | `reserved` (`cmd/agentbox/main.go`) |
+| **Flags** | Global and per-command flags: their names, arity, and meaning. | flag parser (`cmd/agentbox/main.go`) |
 | **Exit codes** | The numeric value and meaning of each agentbox-owned code (64/69/70/77/78) and the "in-box code passed through verbatim" rule. | `Ex*` consts (`internal/app/app.go`) |
 | **Config schema** | Every `agentbox.toml` key: its path, type, allowed values, backend scope, and the "unknown keys are hard errors" rule. | `schema` map (`internal/config/schema.go`) |
 | **Egress bundles** | Bundle names and the endpoint set each expands to. See [the bundle rule](#egress-bundles-a-special-case). | `Bundles` (`internal/netpol/netpol.go`) |
@@ -80,7 +80,7 @@ SemVer level:
 
 - **Widening** a bundle (adding endpoints) widens every user's egress the
   moment they upgrade. It is at least a MINOR change and **must** carry an
-  explicit `CHANGELOG.md` entry naming the bundle and the added endpoints.
+  explicit release-note entry naming the bundle and the added endpoints.
 - **Removing or renaming** a bundle, or **narrowing** it (dropping endpoints
   a workflow may depend on), is breaking (MAJOR at ≥1.0).
 
@@ -93,7 +93,7 @@ Prefer deprecation over removal. A deprecated flag, key, or subcommand:
 
 1. Keeps working for **at least one MINOR release** (one `0.Y` pre-1.0).
 2. Emits a warning to **stderr** on every use, naming the replacement.
-3. Is recorded under a `Deprecated` heading in `CHANGELOG.md`.
+3. Is recorded under a `Deprecated` heading in the release notes.
 4. Is removed no earlier than the next MAJOR (or next MINOR pre-1.0), and
    the removal is itself a breaking-change entry.
 
@@ -111,7 +111,7 @@ from `git describe`; a release keeps the two in sync. Releasing is:
    against the last released version; let it compute the **minimum required
    bump**.
 2. Choose the new version ≥ that minimum.
-3. Update `ToolVersion`, move the `CHANGELOG.md` `[Unreleased]` section under
+3. Update `ToolVersion`, move the release notes' `[Unreleased]` section under
    the new `vX.Y.Z` heading with a date, and update the man-page `.TH`
    version fields.
 4. Tag `vX.Y.Z` on GitHub. There is **no build or packaging pipeline** —
@@ -132,7 +132,7 @@ surface is machine-readable; a checklist where it is not.
 The table in [The public contract](#the-public-contract-covered-by-semver)
 is not just documentation — every row (except the two human-judgment ones)
 points at an in-code value that can be serialized: the `schema` map, the
-`completionCommands`/`reserved` sets, the `Bundles` registry, the `Ex*`
+`reserved` set, the `Bundles` registry, the `Ex*`
 consts, and the `BoxMeta` struct. That makes a **contract manifest**
 possible: one canonical JSON document that fully describes the covered
 surfaces at a given commit.
@@ -178,7 +178,7 @@ golden test** (it can read them without exporting anything):
 
 Helpers to add: `config.SchemaSpecs() map[string]Spec` and
 `app.Subcommands() []string` are thin accessors over values that already
-exist (the `schema` map and `completionCommands`). `netpol.Bundles` and the
+exist (the `schema` map). `netpol.Bundles` and the
 `Ex*` consts are already exported. The one genuinely new value is an
 explicit `state.BoxMetaSchema` version integer stamped into `BoxMeta` — the
 struct exists but is not yet versioned, and versioning it is worth doing on
@@ -201,7 +201,7 @@ its own so an older agentbox can refuse a newer box's metadata cleanly.
 | Config key | removed / kind changed / enum narrowed / scope changed / newly required | **breaking** |
 | Config key | added (optional) / enum widened | additive |
 | Bundle | removed / renamed / narrowed | **breaking** |
-| Bundle | widened (endpoints added) | additive **+ requires a CHANGELOG note** |
+| Bundle | widened (endpoints added) | additive **+ requires a release note** |
 | Bundle | added | additive |
 | State | `boxmeta_schema` incompatible bump / layout change | **breaking** |
 
@@ -216,12 +216,12 @@ proposed bump is too small, e.g.:
 ```
 contract-check: FAIL
   config key removed: [resources.pids]           -> requires MAJOR
-  bundle widened: npm (+registry.npmjs.example)  -> requires CHANGELOG note (missing)
+  bundle widened: npm (+registry.npmjs.example)  -> requires release note (missing)
   proposed: v0.2.1 (PATCH)  minimum: v0.3.0
 ```
 
 For bundle widenings it additionally greps the diff hunk for a matching
-`CHANGELOG.md` entry and fails if absent — enforcing the egress-disclosure
+release-note entry and fails if absent — enforcing the egress-disclosure
 rule mechanically.
 
 ### 5. Human-review surfaces
@@ -272,7 +272,6 @@ what makes that review tractable in the meantime.
 
 ## See also
 
-- [CHANGELOG.md](../CHANGELOG.md) — where every classified change is recorded
 - [docs/configuration.md](configuration.md) — the config schema this versions
 - [docs/security.md](security.md) — the security properties this protects
 - `agentbox-security(7)` — the property table under review each release

@@ -27,7 +27,6 @@ const (
 	kFloat
 	kStringList
 	kStringMap // table of string -> string
-	kTableList // array of tables (workspace.mounts)
 	kDuration  // "30m", "1h", "0"
 	kSize      // "8g", "512m"
 	kNumber    // int or float (resources.cpus)
@@ -43,20 +42,12 @@ type keySpec struct {
 // single key (open key sets: toolchains, variables).
 var schema = map[string]keySpec{
 	"version": {kind: kInt},
-	"extends": {kind: kString},
 
-	"box.name":            {kind: kString},
-	"box.profile":         {kind: kString},
 	"box.default_command": {kind: kCommand},
-	"box.default_agent":   {kind: kString},
 	"box.idle_timeout":    {kind: kDuration},
 
-	"project.max_boxes": {kind: kInt},
-
-	"workspace.mount":     {kind: kString},
-	"workspace.readonly":  {kind: kBool},
-	"workspace.tree_mode": {kind: kString, enum: []string{"auto", "shared", "worktree", "copy"}},
-	"workspace.mounts":    {kind: kTableList},
+	"workspace.mount":    {kind: kString},
+	"workspace.readonly": {kind: kBool},
 
 	"toolchains.*": {kind: kString},
 
@@ -69,7 +60,7 @@ var schema = map[string]keySpec{
 	"agents.install": {kind: kStringList},
 	"agents.channel": {kind: kString, enum: []string{"stable", "latest"}},
 
-	"network.mode":                  {kind: kString, enum: []string{"none", "proxy", "open"}},
+	"network.mode":                  {kind: kString, enum: []string{"off", "proxy", "open"}},
 	"network.bundles":               {kind: kStringList},
 	"network.allow":                 {kind: kStringList},
 	"network.deny":                  {kind: kStringList},
@@ -94,17 +85,11 @@ var schema = map[string]keySpec{
 	"security.container.cap_add":           {kind: kStringList},
 	"security.container.userns":            {kind: kString, enum: []string{"auto", "keep-id", "host", "off"}},
 	"security.container.seccomp":           {kind: kString},
-	// guest_root exists under container solely to be explicit; "deny" is the
-	// only accepted value.
-	"security.container.guest_root": {kind: kString, enum: []string{"deny"}},
 
-	// "krun"/"libkrun" stay in these enums on purpose, though the vm tier
-	// refuses them: parsing the value is what lets backend.ResolveVMRuntime
-	// answer with the specific reason (crun implements no exec —
-	// containers/crun#2090) instead of a generic unknown-value error that
-	// explains nothing. Do not "tidy" them out.
-	"security.vm.hypervisor":     {kind: kString, enum: []string{"auto", "qemu", "cloud-hypervisor", "libkrun"}},
-	"security.vm.runtime":        {kind: kString, enum: []string{"auto", "kata", "krun"}},
+	// The vm tier is Kata via a container engine. There is no hypervisor or
+	// runtime key: offering a choice agentbox cannot honor is how the krun
+	// mess happened -- a value that parsed, selected, created a box, and then
+	// could not be entered.
 	"security.vm.guest_root":     {kind: kString, enum: []string{"allow", "deny"}},
 	"security.vm.nested_docker":  {kind: kBool},
 	"security.vm.memory_backing": {kind: kString, enum: []string{"balloon", "prealloc"}},
@@ -115,16 +100,6 @@ var schema = map[string]keySpec{
 
 	"variables.*":                 {kind: kString},
 	"variables.passthrough.names": {kind: kStringList},
-
-	"hooks.pre_up":   {kind: kStringList},
-	"hooks.post_up":  {kind: kStringList},
-	"hooks.pre_exec": {kind: kCommand},
-
-	// User/system-level only, but statically valid anywhere per schema; the
-	// loader rejects [limits] in a workspace config separately.
-	"limits.max_boxes":        {kind: kInt},
-	"limits.max_total_memory": {kind: kSize},
-	"limits.on_limit":         {kind: kString, enum: []string{"error", "reap-idle"}},
 }
 
 // scopedLeafOwner maps a bare backend-specific key name to the scoped table
@@ -137,11 +112,9 @@ var scopedLeafOwner = map[string]string{
 	"cap_add":           "security.container",
 	"userns":            "security.container",
 	"seccomp":           "security.container",
-	"hypervisor":        "security.vm",
 	"nested_docker":     "security.vm",
 	"memory_backing":    "security.vm",
-	// guest_root is legal in both scoped tables and nowhere else.
-	"guest_root": "security.container or security.vm",
+	"guest_root":        "security.vm",
 }
 
 // KeyScope returns the scope of a dotted key path.
@@ -232,49 +205,6 @@ func (s keySpec) validate(path string, v any) error {
 				return fmt.Errorf("%s.%s: expected string, got %T", path, k, el)
 			}
 		}
-	case kTableList:
-		list, ok := v.([]map[string]any)
-		if !ok {
-			// BurntSushi may decode [[x]] as []map[string]any or []any.
-			if la, ok2 := v.([]any); ok2 {
-				for _, el := range la {
-					if _, ok3 := el.(map[string]any); !ok3 {
-						return bad("array of tables")
-					}
-				}
-				return validateMountTables(path, la)
-			}
-			return bad("array of tables")
-		}
-		anys := make([]any, len(list))
-		for i, m := range list {
-			anys[i] = m
-		}
-		return validateMountTables(path, anys)
-	}
-	return nil
-}
-
-var mountKeys = map[string]bool{"source": true, "target": true, "mode": true}
-
-func validateMountTables(path string, list []any) error {
-	for i, el := range list {
-		m := el.(map[string]any)
-		for k, v := range m {
-			if !mountKeys[k] {
-				return fmt.Errorf("%s[%d]: unknown key %q", path, i, k)
-			}
-			s, ok := v.(string)
-			if !ok {
-				return fmt.Errorf("%s[%d].%s: expected string", path, i, k)
-			}
-			if k == "mode" && s != "ro" && s != "rw" {
-				return fmt.Errorf("%s[%d].mode: invalid value %q (one of: ro, rw)", path, i, s)
-			}
-		}
-		if m["source"] == nil || m["target"] == nil {
-			return fmt.Errorf("%s[%d]: source and target are required", path, i)
-		}
 	}
 	return nil
 }
@@ -282,8 +212,6 @@ func validateMountTables(path string, list []any) error {
 // ValidateTree walks a raw decoded TOML tree and returns every schema error:
 // unknown keys (hard errors), type errors, enum violations, and
 // backend-scope violations with a message naming the correct location.
-// prefix is "" for a top-level layer or "profiles.NAME" when validating a
-// profile overlay body.
 func ValidateTree(tree map[string]any) []error {
 	var errs []error
 	walkTree(tree, "", &errs)
@@ -296,28 +224,6 @@ func walkTree(tree map[string]any, prefix string, errs *[]error) {
 		path := k
 		if prefix != "" {
 			path = prefix + "." + k
-		}
-
-		// Profile overlays validate their body as a top-level tree.
-		if path == "profiles" {
-			profs, ok := v.(map[string]any)
-			if !ok {
-				*errs = append(*errs, fmt.Errorf("profiles: expected table"))
-				continue
-			}
-			for name, body := range profs {
-				b, ok := body.(map[string]any)
-				if !ok {
-					*errs = append(*errs, fmt.Errorf("profiles.%s: expected table", name))
-					continue
-				}
-				var perrs []error
-				walkTree(b, "", &perrs)
-				for _, e := range perrs {
-					*errs = append(*errs, fmt.Errorf("profiles.%s: %w", name, e))
-				}
-			}
-			continue
 		}
 
 		if spec, ok := lookupSpec(path); ok {

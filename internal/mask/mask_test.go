@@ -208,3 +208,26 @@ func TestLoadMatcherPrecedence(t *testing.T) {
 		t.Error("workspace negation must override the global rule")
 	}
 }
+
+// An unprivileged teardown of a directory that is not a mountpoint must be a
+// no-op, not an error: umount(2) checks CAP_SYS_ADMIN before it checks whether
+// anything is mounted, so a plain directory returns EPERM rather than EINVAL.
+// Getting this wrong made `rm` fail on every filter-mode box, whose share
+// daemon has already retracted its own mount by the time teardown runs.
+func TestTeardownViewOnPlainDirectoryIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	view := filepath.Join(dir, "view")
+	if err := os.MkdirAll(view, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := TeardownView(view); err != nil {
+		t.Fatalf("tearing down a non-mountpoint must succeed, got: %v", err)
+	}
+	if _, err := os.Stat(view); !os.IsNotExist(err) {
+		t.Errorf("view root should be removed, stat err = %v", err)
+	}
+	// And again, on a path that no longer exists.
+	if err := TeardownView(view); err != nil {
+		t.Errorf("teardown must be idempotent, got: %v", err)
+	}
+}

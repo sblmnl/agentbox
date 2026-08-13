@@ -12,7 +12,7 @@ import (
 
 // Modes.
 const (
-	ModeNone  = "none"  // no egress path exists; no proxy
+	ModeOff   = "off"   // no egress path exists; no proxy
 	ModeProxy = "proxy" // no route out; all egress via the policy proxy
 	ModeOpen  = "open"  // ordinary network access; warns every invocation
 )
@@ -111,12 +111,14 @@ var TelemetryDisableVars = map[string]map[string]string{
 	},
 }
 
-// Policy is the evaluated egress policy for one box.
+// Policy is the evaluated egress policy for one box. The JSON tags matter:
+// `--dry-run --json` is how the egress policy is inspected, so its shape is
+// part of the documented contract.
 type Policy struct {
-	Mode  string
-	Allow []string // resolved effective allow set (bundles ∪ allow, sorted)
-	Deny  []string // deny entries; evaluated first, always win
-	Audit bool
+	Mode  string   `json:"mode"`
+	Allow []string `json:"allow"` // resolved effective allow set (bundles ∪ allow, sorted)
+	Deny  []string `json:"deny"`  // deny entries; evaluated first, always win
+	Audit bool     `json:"audit"`
 }
 
 // Resolve expands bundles and validates entries. Effective set = union of
@@ -136,7 +138,7 @@ func Resolve(mode string, bundleNames, allow, deny []string) (*Policy, error) {
 	for _, b := range bundleNames {
 		domains, ok := Bundles[b]
 		if !ok {
-			return nil, fmt.Errorf("unknown bundle %q (see `agentbox bundles --list`)", b)
+			return nil, fmt.Errorf("unknown bundle %q (known bundles: %s)", b, strings.Join(BundleNames(), ", "))
 		}
 		for _, d := range domains {
 			addAllow(d)

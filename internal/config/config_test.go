@@ -19,9 +19,6 @@ func writeFile(t *testing.T, path, content string) {
 
 func load(t *testing.T, opts LoadOptions) (*Result, error) {
 	t.Helper()
-	if opts.SystemPath == "" {
-		opts.SystemPath = filepath.Join(t.TempDir(), "nonexistent-system.toml")
-	}
 	if opts.UserConfigDir == "" {
 		opts.UserConfigDir = t.TempDir()
 	}
@@ -35,7 +32,7 @@ func TestBuiltinDefaultsParse(t *testing.T) {
 	}
 	c := res.Config
 	if c.Network.Mode != "proxy" || c.Security.MinIsolation != "container" ||
-		c.Security.Container.GuestRoot != "deny" || c.Workspace.TreeMode != "auto" {
+		c.Security.MaskMode != "auto" || c.Workspace.Mount != "/workspace" {
 		t.Errorf("unexpected defaults: %+v", c)
 	}
 }
@@ -67,25 +64,6 @@ func TestDockerfileRelativeToUserConfigDir(t *testing.T) {
 	}
 }
 
-func TestDockerfileRelativeToExtendsBase(t *testing.T) {
-	ws := t.TempDir()
-	baseDir := filepath.Join(ws, "shared")
-	// A relative [image].dockerfile set by an extends base resolves against
-	// the base file's own directory, not the extending file's or the CWD.
-	writeFile(t, filepath.Join(baseDir, "base.toml"), "version = 1\n[image]\ndockerfile = \"base.Dockerfile\"\n")
-	writeFile(t, filepath.Join(baseDir, "base.Dockerfile"), "FROM ubuntu:26.04\n")
-	writeFile(t, filepath.Join(ws, "agentbox.toml"), "version = 1\nextends = \"shared/base.toml\"\n")
-
-	res, err := load(t, LoadOptions{WorkspaceRoot: ws})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := filepath.Join(baseDir, "base.Dockerfile")
-	if got := res.Config.Image.Dockerfile; got != want {
-		t.Errorf("dockerfile = %q, want %q (resolved next to the extends base that set it)", got, want)
-	}
-}
-
 func TestBackendScopeStatic(t *testing.T) {
 	cases := []struct {
 		toml    string
@@ -93,8 +71,7 @@ func TestBackendScopeStatic(t *testing.T) {
 	}{
 		{"[security]\ncap_drop = [\"ALL\"]", "security.container"},
 		{"[security]\nnested_docker = true", "security.vm"},
-		{"[security]\nguest_root = \"allow\"", "security.container or security.vm"},
-		{"[security]\nhypervisor = \"qemu\"", "security.vm"},
+		{"[security]\nguest_root = \"allow\"", "security.vm"},
 		{"[security]\nuserns = \"keep-id\"", "security.container"},
 		// cap_drop has no meaning to a hypervisor: absent from vm scope,
 		// and the error names where it belongs.
@@ -116,26 +93,6 @@ func TestBackendScopeStatic(t *testing.T) {
 	}
 }
 
-func TestContainerGuestRootAllowRejected(t *testing.T) {
-	ws := t.TempDir()
-	writeFile(t, filepath.Join(ws, "agentbox.toml"),
-		"version = 1\n[security.container]\nguest_root = \"allow\"\n")
-	_, err := load(t, LoadOptions{WorkspaceRoot: ws})
-	if err == nil {
-		t.Fatal("guest_root = \"allow\" under container must be a parse error")
-	}
-	if !strings.Contains(err.Error(), "guest_root") {
-		t.Errorf("error should name the key: %v", err)
-	}
-	// And "allow" is fine under vm scope.
-	ws2 := t.TempDir()
-	writeFile(t, filepath.Join(ws2, "agentbox.toml"),
-		"version = 1\n[security.vm]\nguest_root = \"allow\"\n")
-	if _, err := load(t, LoadOptions{WorkspaceRoot: ws2}); err != nil {
-		t.Errorf("guest_root = \"allow\" under vm should be legal: %v", err)
-	}
-}
-
 func TestUnknownKeysHardError(t *testing.T) {
 	ws := t.TempDir()
 	writeFile(t, filepath.Join(ws, "agentbox.toml"),
@@ -143,6 +100,32 @@ func TestUnknownKeysHardError(t *testing.T) {
 	_, err := load(t, LoadOptions{WorkspaceRoot: ws})
 	if err == nil || !strings.Contains(err.Error(), "securiy") {
 		t.Fatalf("misspelled table must fail naming the key, got: %v", err)
+	}
+}
+
+// The keys removed in the MVP scale-back must fail loudly rather than being
+// ignored: a config that still carries them is asking for behavior agentbox
+// no longer has, and silently dropping it would be the exact "silently
+// ignored key" failure the schema exists to prevent.
+func TestRemovedKeysAreHardErrors(t *testing.T) {
+	for _, body := range []string{
+		"extends = \"base.toml\"",
+		"[box]\nprofile = \"x\"",
+		"[project]\nmax_boxes = 2",
+		"[workspace]\ntree_mode = \"worktree\"",
+		"[[workspace.mounts]]\nsource = \"/a\"\ntarget = \"/b\"",
+		"[hooks]\npre_up = [\"echo hi\"]",
+		"[limits]\nmax_boxes = 3",
+		"[security.vm]\nruntime = \"krun\"",
+		"[security.vm]\nhypervisor = \"libkrun\"",
+		"[security.container]\nguest_root = \"deny\"",
+		"[profiles.x.network]\nmode = \"off\"",
+	} {
+		ws := t.TempDir()
+		writeFile(t, filepath.Join(ws, "agentbox.toml"), "version = 1\n"+body+"\n")
+		if _, err := load(t, LoadOptions{WorkspaceRoot: ws}); err == nil {
+			t.Errorf("removed key %q was accepted; it must be a hard error", body)
+		}
 	}
 }
 
@@ -178,7 +161,7 @@ func TestOriginTracking(t *testing.T) {
 	user := t.TempDir()
 	writeFile(t, filepath.Join(user, "config.toml"), "[network]\nmode = \"open\"\n")
 	ws := t.TempDir()
-	writeFile(t, filepath.Join(ws, "agentbox.toml"), "version = 1\n[network]\nmode = \"none\"\n")
+	writeFile(t, filepath.Join(ws, "agentbox.toml"), "version = 1\n[network]\nmode = \"off\"\n")
 	res, err := load(t, LoadOptions{WorkspaceRoot: ws, UserConfigDir: user})
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +170,7 @@ func TestOriginTracking(t *testing.T) {
 	if !strings.HasPrefix(origin, LayerWorkspace) {
 		t.Errorf("network.mode origin = %q, want workspace layer", origin)
 	}
-	if res.Config.Network.Mode != "none" {
+	if res.Config.Network.Mode != "off" {
 		t.Errorf("mode = %q", res.Config.Network.Mode)
 	}
 }
@@ -202,72 +185,156 @@ func TestBothWorkspaceFilesError(t *testing.T) {
 	}
 }
 
-func TestExtendsAndCycle(t *testing.T) {
+// The central invariant: a workspace config may win, but never quietly. A repo
+// that drops the tier, opens egress, or turns off masking relative to what the
+// user asked for must produce a warning naming the key and both values.
+func TestWorkspaceWeakeningWarnsPerKey(t *testing.T) {
+	cases := []struct {
+		name       string
+		userTOML   string
+		wsTOML     string
+		wantKey    string
+		wantValues []string
+	}{
+		{
+			name:       "isolation floor lowered",
+			userTOML:   "[security]\nmin_isolation = \"vm\"\n",
+			wsTOML:     "version = 1\n[security]\nmin_isolation = \"container\"\n",
+			wantKey:    "security.min_isolation",
+			wantValues: []string{`"vm"`, `"container"`},
+		},
+		{
+			name:       "egress opened",
+			userTOML:   "[network]\nmode = \"proxy\"\n",
+			wsTOML:     "version = 1\n[network]\nmode = \"open\"\n",
+			wantKey:    "network.mode",
+			wantValues: []string{`"proxy"`, `"open"`},
+		},
+		{
+			name:       "masking weakened",
+			userTOML:   "[security]\nmask_mode = \"filter\"\n",
+			wsTOML:     "version = 1\n[security]\nmask_mode = \"view\"\n",
+			wantKey:    "security.mask_mode",
+			wantValues: []string{`"filter"`, `"view"`},
+		},
+		{
+			name:       "setuid stripping disabled",
+			userTOML:   "[security]\nstrip_setuid = true\n",
+			wsTOML:     "version = 1\n[security]\nstrip_setuid = false\n",
+			wantKey:    "security.strip_setuid",
+			wantValues: []string{"true", "false"},
+		},
+		{
+			name:       "guest root allowed",
+			userTOML:   "[security.vm]\nguest_root = \"deny\"\n",
+			wsTOML:     "version = 1\n[security.vm]\nguest_root = \"allow\"\n",
+			wantKey:    "security.vm.guest_root",
+			wantValues: []string{`"deny"`, `"allow"`},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			user := t.TempDir()
+			writeFile(t, filepath.Join(user, "config.toml"), c.userTOML)
+			ws := t.TempDir()
+			writeFile(t, filepath.Join(ws, "agentbox.toml"), c.wsTOML)
+
+			res, err := load(t, LoadOptions{WorkspaceRoot: ws, UserConfigDir: user})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var warning string
+			for _, w := range res.Warnings {
+				if strings.Contains(w, c.wantKey) {
+					warning = w
+				}
+			}
+			if warning == "" {
+				t.Fatalf("no warning naming %s; a workspace config weakened a security key silently.\nwarnings: %v",
+					c.wantKey, res.Warnings)
+			}
+			for _, v := range c.wantValues {
+				if !strings.Contains(warning, v) {
+					t.Errorf("warning does not show value %s: %q", v, warning)
+				}
+			}
+			// Naming the file is the actionable half: in a repo the user did
+			// not write, "the workspace config" alone leaves them with
+			// nothing to open.
+			wsFile := filepath.Join(ws, "agentbox.toml")
+			if !strings.Contains(warning, wsFile) {
+				t.Errorf("warning does not name the file that weakened the key (%s): %q", wsFile, warning)
+			}
+			// A remediation clause naming a flag that cannot override the key
+			// is worse than none: --config takes a path and replaces the
+			// whole workspace layer.
+			if strings.Contains(warning, "--config") {
+				t.Errorf("warning advises --config, which cannot override a single key: %q", warning)
+			}
+		})
+	}
+}
+
+// The mirror image: a workspace config that *tightens* is doing exactly what a
+// project config is for, and must not be nagged about.
+func TestWorkspaceTighteningIsQuiet(t *testing.T) {
+	user := t.TempDir()
+	writeFile(t, filepath.Join(user, "config.toml"), "[security]\nmin_isolation = \"container\"\n[network]\nmode = \"open\"\n")
 	ws := t.TempDir()
-	writeFile(t, filepath.Join(ws, "base.toml"), "[toolchains]\nnode = \"24\"\n[network]\nbundles = [\"npm\"]\n")
 	writeFile(t, filepath.Join(ws, "agentbox.toml"),
-		"version = 1\nextends = \"base.toml\"\n[network]\nbundles = [\"github\"]\n")
+		"version = 1\n[security]\nmin_isolation = \"vm\"\n[network]\nmode = \"proxy\"\n")
+
+	res, err := load(t, LoadOptions{WorkspaceRoot: ws, UserConfigDir: user})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "lowered") {
+			t.Errorf("tightening must not warn, got: %q", w)
+		}
+	}
+}
+
+// A flag is typed by the person at the prompt, so it is allowed to loosen
+// anything -- and it also clears the complaint about the workspace, because
+// the workspace value is no longer what is in effect.
+func TestFlagLooseningIsNotWarnedAbout(t *testing.T) {
+	user := t.TempDir()
+	writeFile(t, filepath.Join(user, "config.toml"), "[network]\nmode = \"off\"\n")
+	ws := t.TempDir()
+	writeFile(t, filepath.Join(ws, "agentbox.toml"), "version = 1\n[network]\nmode = \"proxy\"\n")
+
+	res, err := load(t, LoadOptions{WorkspaceRoot: ws, UserConfigDir: user})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := res.ApplyFlags(map[string]any{"network": map[string]any{"mode": "open"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "network.mode") {
+			t.Errorf("an explicit flag must not be warned about as a workspace weakening: %q", w)
+		}
+	}
+}
+
+// A workspace weakening relative to the *built-in* default counts too: the
+// user never chose the weaker value just because they never wrote a config.
+func TestWorkspaceWeakeningAgainstBuiltinDefault(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, filepath.Join(ws, "agentbox.toml"), "version = 1\n[network]\nmode = \"open\"\n")
 	res, err := load(t, LoadOptions{WorkspaceRoot: ws})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Config.Toolchains["node"] != "24" {
-		t.Error("extends layer not applied")
+	found := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "network.mode") {
+			found = true
+		}
 	}
-	if got := strings.Join(res.Config.Network.Bundles, ","); got != "npm,github" {
-		t.Errorf("extends array append: %q", got)
-	}
-
-	ws2 := t.TempDir()
-	writeFile(t, filepath.Join(ws2, "a.toml"), "extends = \"agentbox.toml\"\n")
-	writeFile(t, filepath.Join(ws2, "agentbox.toml"), "version = 1\nextends = \"a.toml\"\n")
-	if _, err := load(t, LoadOptions{WorkspaceRoot: ws2}); err == nil || !strings.Contains(err.Error(), "cycle") {
-		t.Errorf("expected extends cycle error, got %v", err)
-	}
-}
-
-func TestProfileOverlay(t *testing.T) {
-	ws := t.TempDir()
-	writeFile(t, filepath.Join(ws, "agentbox.toml"), `version = 1
-[network]
-mode = "proxy"
-[profiles.airgapped]
-[profiles.airgapped.network]
-mode = "none"
-`)
-	res, err := load(t, LoadOptions{WorkspaceRoot: ws, ProfileName: "airgapped"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Config.Network.Mode != "none" {
-		t.Errorf("profile overlay not applied: mode = %q", res.Config.Network.Mode)
-	}
-	// Unknown profile errors rather than silently no-oping.
-	if _, err := load(t, LoadOptions{WorkspaceRoot: ws, ProfileName: "nope"}); err == nil {
-		t.Error("unknown profile must error")
-	}
-}
-
-func TestEnvLayer(t *testing.T) {
-	ws := t.TempDir()
-	writeFile(t, filepath.Join(ws, "agentbox.toml"), "version = 1\n[network]\nmode = \"proxy\"\n")
-	res, err := load(t, LoadOptions{
-		WorkspaceRoot: ws,
-		Environ:       []string{"AGENTBOX_NETWORK__MODE=none"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Config.Network.Mode != "none" {
-		t.Errorf("env layer not applied: %q", res.Config.Network.Mode)
-	}
-	// An invalid env value is a schema error like any other layer's.
-	_, err = load(t, LoadOptions{
-		WorkspaceRoot: ws,
-		Environ:       []string{"AGENTBOX_NETWORK__MODE=bogus"},
-	})
-	if err == nil {
-		t.Error("invalid env value must fail schema validation")
+	if !found {
+		t.Errorf("a workspace opening egress against the proxy default must warn; warnings: %v", res.Warnings)
 	}
 }
 
@@ -294,7 +361,7 @@ func TestCapAddWarns(t *testing.T) {
 func TestEnumValidation(t *testing.T) {
 	ws := t.TempDir()
 	writeFile(t, filepath.Join(ws, "agentbox.toml"),
-		"version = 1\n[workspace]\ntree_mode = \"blended\"\n")
+		"version = 1\n[network]\nmode = \"blended\"\n")
 	if _, err := load(t, LoadOptions{WorkspaceRoot: ws}); err == nil {
 		t.Fatal("invalid enum value must fail")
 	}

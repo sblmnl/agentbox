@@ -1,4 +1,4 @@
-.TH AGENTBOX-SECURITY 7 "2026-08-07" "agentbox 0.0.1-dev" "Miscellaneous"
+.TH AGENTBOX-SECURITY 7 "2026-08-10" "agentbox 0.0.1-dev" "Miscellaneous"
 .SH NAME
 agentbox-security \- what agentbox does and does not protect against
 .SH STATUS
@@ -14,7 +14,7 @@ agentbox does not make it \[dq]safe\[dq] to run an agent unattended, and its
 two isolation tiers are not equivalent. The accurate claim is narrower: the
 blast radius of an agent mistake is reduced to one workspace tree and one
 egress allowlist, both inspectable beforehand
-.RB ( "agentbox mounts" ", " masks ", " "config \-\-origin" ", " \-\-dry\-run )
+.RB ( "agentbox \-\-dry\-run \-\-json" ", " "config \-\-origin" )
 and logged after
 .RB ( "logs \-\-denied" ).
 That is what makes skipping interactive approval a defensible engineering
@@ -52,7 +52,7 @@ Capability restriction|cap_drop: ALL|Not applicable
 Setuid removal|Yes|Yes (image property)
 Read-only root|Yes|Guest-local, weaker meaning
 Resource limits|Host cgroup, agent cannot raise|Guest-visible; guest root may raise
-Egress control|Host-side sidecar proxy|Host daemon over vsock
+Egress control|Sidecar proxy, by name|Sidecar proxy, by pinned IP
 Inter-box reachability|Denied by network topology|Denied by network topology
 Cross-box state access|Denied \(em separate volumes/views|Denied \(em separate disks/views
 Startup cost|~100 ms|seconds
@@ -60,11 +60,11 @@ Memory model|Shares host page cache|Private kernel and page cache
 Requires KVM / nested virt|No|Yes
 .TE
 .PP
-The current release implements both tiers. The vm tier runs on an
-OCI-consuming VM runtime \(em Kata Containers, via docker \(em and requires
-/dev/kvm. libkrun is not usable: crun's libkrun handler implements no exec
-callback, so nothing can enter a box it created, and agentbox refuses it by
-name. Where hardware or runtime is missing, a project
+The current release implements both tiers. The vm tier is Kata Containers
+via Docker, and requires /dev/kvm. Podman is not offered for this tier: its
+VM path is libkrun, whose crun handler implements no exec callback, so
+nothing can enter a box it created. Where hardware or runtime is missing, a
+project
 declaring
 .B min_isolation = \[dq]vm\[dq]
 exits 69 naming what would fix it rather than silently substituting the
@@ -87,10 +87,8 @@ agent root on the host.
 .PP
 Boxes cannot reach one another, over the network or through shared state:
 each box gets its own network, its own persistent home, and its own mask
-view. The single deliberate exception is
-.BR "tree_mode = \[dq]shared\[dq]" ,
-where boxes see one working tree by explicit configuration, warned at
-creation.
+view. Two boxes means two workspace roots, so they do not share a working
+tree either.
 .SH MASKING
 Masking constructs the masked view on the host side of the filesystem
 boundary and presents that to the guest, so enforcement does not depend on
@@ -127,12 +125,8 @@ exist in the guest.
 .IP 3. 4
 .B .git/ should not be masked.
 It costs diff, commit, and history for almost no gain.
-.B doctor
-warns when a config does this.
+It is deliberately absent from the scaffolded patterns.
 .IP 4. 4
-.B Anything in [[workspace.mounts]] bypasses masking
-unless separately matched.
-.IP 5. 4
 .B Masking is not a secrets manager.
 For credentials that need not sit in the tree at all, prefer
 .B [variables.passthrough]
@@ -151,54 +145,55 @@ matches on the CONNECT target, leaving certificate validation end-to-end.
 Every request, including denials, is logged.
 .B deny
 entries are evaluated first and win. An HTTP CONNECT proxy cannot carry
-SSH: git operations must use HTTPS remotes in proxy mode, and
-.B doctor
-detects SSH remotes rather than leaving you to discover this mid-session.
+SSH: git operations must use HTTPS remotes in proxy mode.
 .PP
-The tiers place the proxy differently. Under the container tier it is a
-sidecar container straddling the box's internal network and an egress
-network. Under the vm tier it is a host daemon reached over
-.BR vsock :
-a forwarder inside the box listens on loopback, which is what
-.B HTTPS_PROXY
-points at, and carries connections to the daemon over the hypervisor
-channel; the box network stays internal and carries no egress. A guest's
-path to a host process over the bridge would be ordinary IP traffic subject
-to the host's INPUT policy and to VPN kill-switches that accept only RFC
-1918 as local, either of which drops it invisibly and leaves the box looking
-healthy while every network call hangs. vsock has no address to filter.
-Boxes are attributed by a per-box token minted at create time; a connection
-whose token matches no running box is closed unserved, and the audit log
-records the unforgeable peer context id.
+Both tiers use the same topology, so an allowlist means one thing: a per-box
+internal bridge with no route off it, and a squid sidecar straddling that
+bridge and a second, routable network. The policy engine, its generated
+configuration and its hardening are shared code between the tiers.
+.PP
+The vm tier differs only in how the box addresses that sidecar, and for one
+reason. A Kata guest can reach a sibling container over an ordinary bridge,
+but it cannot reach the engine's embedded DNS resolver: the engine publishes
+it at 127.0.0.11 inside the network namespace, and a VM guest's loopback is
+its own. Container names therefore do not resolve, so the vm tier addresses
+its sidecar by a pinned IP. In
+.B proxy
+mode the guest needs no resolver at all \(em the proxy resolves on its
+behalf, which also denies the box a DNS channel of its own. Only
+.B open
+mode needs one, and there agentbox bind-mounts a generated
+.B /etc/resolv.conf
+carrying the host's real upstream nameservers.
 .SH GUEST ROOT
 Under the container tier, guest root is denied by construction: the image
-has no sudo, setuid bits are stripped, and
-.B guest_root = \[dq]allow\[dq]
-under
-.B [security.container]
-is a parse error. The reasoning: a guest process with CAP_SYS_ADMIN could
+has no sudo, setuid bits are stripped, and the backend refuses to construct
+a container-tier box that asks for guest root. The reasoning: a guest process with CAP_SYS_ADMIN could
 unmount a mask and read through it, converting every mask from a boundary
 into a suggestion \(em silently, with no error and no log line. The vm tier
 is where the frequent agent request for root can be granted, because mask
 enforcement lives outside the guest.
-.SH WORKSPACE CONFIG TRUST
+.SH A COMMITTED CONFIG OUTRANKS YOURS
 .B agentbox.toml
-is committed, so cloning a repository executes configuration you did not
-write. Host-side
-.B [hooks]
-and
-.B [[workspace.mounts]]
-are refused until the file is reviewed and accepted with
-.BR "agentbox trust" ;
-any edit invalidates the trust record. Inspection commands
-.RB ( config ", " mounts ", " doctor ", ...)"
-still work against an untrusted config \(em they are how you review it.
+is committed, so cloning a repository applies configuration you did not
+write, above your own user configuration.
+.PP
+agentbox does not execute anything host-side on its behalf: there are no
+hooks and no host-path mounts in the schema, so the worst a workspace config
+can do is ask for a weaker box. It is allowed to, and it cannot do so
+quietly. Any workspace value that loosens a ranked security key relative to
+a lower layer produces a warning on every invocation, naming the key, both
+values, and the file responsible. Tightening is silent. See
+.BR agentbox.toml (5)
+for the ranked keys.
 .SH NO SILENT DIVERGENCE
 One configuration file drives two non-equivalent boundaries, so divergence
 must be loud:
+every invocation that starts a box prints the backend, tier, egress mode and
+mask mode in force, and
 .B status
-prints the active backend, tier, and mask mode on every invocation;
-.B doctor
+prints the same;
+.B version
 names each unavailable backend and why;
 .B min_isolation
 is honored without downgrade;
@@ -206,7 +201,7 @@ backend-specific keys are scope-checked statically on every machine; a box
 created with
 .B \-\-force\-isolation
 warns on every invocation and is flagged by
-.BR status " and " ls .
+.BR status .
 The failure mode defended against is concrete: a configuration verified on
 a bare-metal workstation runs weaker inside a colleague's cloud VM while
 every command still succeeds.

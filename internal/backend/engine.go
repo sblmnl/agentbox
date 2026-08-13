@@ -85,6 +85,23 @@ func engineExec(runner func(args ...string) *exec.Cmd, name string, es ExecSpec)
 	return 0, err
 }
 
+// engineExecQuiet runs a command in a started guest and reports only its exit
+// code, discarding its output. Probes use it: their diagnostics belong in the
+// warning agentbox composes, not interleaved raw into the user's terminal
+// ("bash: connect: Network is unreachable" beside a box that came up fine
+// reads as a failure when it is one retry of a healthy start-up).
+func engineExecQuiet(runner func(args ...string) *exec.Cmd, name string, argv []string) (int, error) {
+	args := append([]string{"exec", name}, argv...)
+	cmd := runner(args...)
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode(), nil
+		}
+		return 0, err
+	}
+	return 0, nil
+}
+
 // engineInspect reads a guest's runtime state.
 func engineInspect(runner func(args ...string) *exec.Cmd, bin, name string) (State, error) {
 	out, err := engineOutput(runner, "inspect", "--format", "{{.State.Running}} {{.State.Pid}} {{.State.Status}} {{.State.ExitCode}}", name)

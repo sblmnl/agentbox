@@ -12,31 +12,15 @@ import (
 	"syscall"
 
 	"github.com/sblmnl/agentbox/internal/app"
-	"github.com/sblmnl/agentbox/internal/netpol"
 	"github.com/sblmnl/agentbox/internal/share"
-	"github.com/sblmnl/agentbox/internal/state"
 )
 
 // Reserved subcommands are a closed, documented set; adding one that
 // collides with a common binary name is a breaking change.
 var reserved = map[string]bool{
-	"run": true, "shell": true, "new": true, "attach": true, "default": true,
-	"up": true, "stop": true, "down": true, "restart": true, "status": true,
-	"ps": true, "logs": true, "build": true, "config": true, "mounts": true,
-	"masks": true, "backends": true, "allow": true, "bundles": true,
-	"init": true, "ls": true, "rm": true, "prune": true, "doctor": true,
-	"trust": true, "completion": true, "version": true, "help": true,
-}
-
-// trustLenient marks the read-only commands that proceed with a warning when
-// the workspace config is untrusted — they are the supported way to
-// review what an untrusted config would do. Everything else that could run
-// hooks or materialize mounts is refused until `agentbox trust`.
-var trustLenient = map[string]bool{
-	"config": true, "mounts": true, "masks": true, "backends": true,
-	"bundles": true, "doctor": true, "version": true, "ls": true,
-	"status": true, "ps": true, "logs": true, "prune": true, "stop": true,
-	"down": true, "rm": true, "trust": true, "completion": true,
+	"run": true, "shell": true, "up": true, "down": true, "status": true,
+	"logs": true, "build": true, "config": true, "init": true, "rm": true,
+	"version": true, "help": true,
 }
 
 func main() {
@@ -55,26 +39,12 @@ func main() {
 }
 
 func run(args []string) (int, error) {
-	// `proxyd` is the hidden host-proxy daemon entry point for the vm
-	// backend, spawned by agentbox itself. It is intercepted before
-	// interpretation: it needs no workspace and is not part of the
-	// documented, closed subcommand set.
-	if len(args) > 0 && args[0] == "proxyd" {
-		return runProxyd(args[1:])
-	}
 	// `fsd` is the hidden share-daemon entry point for mask_mode "filter"
-	// (the Layer 3 filtered share), likewise spawned by agentbox itself
-	// and intercepted before interpretation.
+	// (the Layer 3 filtered share), spawned by agentbox itself. It is
+	// intercepted before interpretation: it needs no workspace and is not
+	// part of the documented, closed subcommand set.
 	if len(args) > 0 && args[0] == "fsd" {
 		return runFsd(args[1:])
-	}
-	// `vsockfwd` is the hidden in-guest half of the vm tier's egress path:
-	// the same binary, bind-mounted into the box and run there, forwarding
-	// loopback to the host daemon over vsock. Intercepted for the same
-	// reason as the others — it is not part of the documented subcommand
-	// set and needs no workspace.
-	if len(args) > 0 && args[0] == "vsockfwd" {
-		return runVsockfwd(args[1:])
 	}
 
 	opts := &app.Options{Timeout: 120}
@@ -118,22 +88,6 @@ func run(args []string) (int, error) {
 			if v, err = take(); err == nil {
 				opts.Workspace = v
 			}
-		case "-n", "--name":
-			if v, err = take(); err == nil {
-				opts.Name = v
-			}
-		case "--new":
-			opts.New = true
-		case "--all":
-			opts.All = true
-		case "--tree-mode":
-			if v, err = take(); err == nil {
-				opts.TreeMode = v
-			}
-		case "-p", "--profile":
-			if v, err = take(); err == nil {
-				opts.Profile = v
-			}
 		case "-c", "--config":
 			if v, err = take(); err == nil {
 				opts.ConfigFile = v
@@ -164,8 +118,6 @@ func run(args []string) (int, error) {
 			if v, err = take(); err == nil {
 				opts.NetworkMode = v
 			}
-		case "--offline":
-			opts.Offline = true
 		case "--rebuild":
 			opts.Rebuild = true
 		case "--recreate":
@@ -224,25 +176,6 @@ func run(args []string) (int, error) {
 	return dispatch(opts, cmd, cmdArgs)
 }
 
-func runProxyd(args []string) (int, error) {
-	root := ""
-	for j := 0; j < len(args); j++ {
-		if args[j] == "--state-root" && j+1 < len(args) {
-			root = args[j+1]
-			j++
-		}
-	}
-	if root == "" {
-		root = state.Dir()
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	if err := netpol.RunDaemon(ctx, root, os.Stdout); err != nil {
-		return 0, app.Softwaref("proxyd: %v", err)
-	}
-	return 0, nil
-}
-
 func runFsd(args []string) (int, error) {
 	spec, pidfile := "", ""
 	for j := 0; j < len(args); j++ {
@@ -266,32 +199,6 @@ func runFsd(args []string) (int, error) {
 	return 0, nil
 }
 
-// runVsockfwd reads its token from the environment rather than a flag: the
-// box's own process table is readable by the agent, and a token on a command
-// line is a capability on display.
-func runVsockfwd(args []string) (int, error) {
-	spec := &netpol.GuestForwarderSpec{
-		Listen: "127.0.0.1:" + strconv.Itoa(netpol.VsockPort),
-		Token:  os.Getenv("AGENTBOX_VSOCK_TOKEN"),
-		Port:   netpol.VsockPort,
-	}
-	for j := 0; j < len(args); j++ {
-		if args[j] == "--listen" && j+1 < len(args) {
-			spec.Listen = args[j+1]
-			j++
-		}
-	}
-	if spec.Token == "" {
-		return 0, app.Usagef("vsockfwd: AGENTBOX_VSOCK_TOKEN is required")
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	if err := netpol.RunGuestForwarder(ctx, spec, os.Stderr); err != nil {
-		return 0, app.Softwaref("vsockfwd: %v", err)
-	}
-	return 0, nil
-}
-
 func runInBox(opts *app.Options, argv []string, shell bool) (int, error) {
 	c, err := app.Resolve(opts)
 	if err != nil {
@@ -304,47 +211,66 @@ func runInBox(opts *app.Options, argv []string, shell bool) (int, error) {
 	return code, err
 }
 
+// takesInBoxArgs reports whether a subcommand's trailing arguments are a
+// command line for the box rather than for agentbox.
+func takesInBoxArgs(cmd string) bool { return cmd == "run" || cmd == "shell" }
+
+// flagScanLimit returns how much of args agentbox may interpret as its own
+// subcommand-local flags.
+//
+// After `run`, args *is* the command line for the box, and agentbox has no
+// business rewriting it: scanning the whole slice means `agentbox run mytool
+// --root` quietly drops the tool's own --root and runs the box as root
+// instead. So for those subcommands only the leading run of flags counts,
+// ending at the first bare word or at `--`. Every other subcommand takes no
+// positional arguments, so its flags stay recognised anywhere.
+func flagScanLimit(cmd string, args []string) int {
+	if !takesInBoxArgs(cmd) {
+		return len(args)
+	}
+	n := 0
+	for n < len(args) && strings.HasPrefix(args[n], "-") && args[n] != "--" {
+		n++
+	}
+	return n
+}
+
+// stripFlagTerminator drops the `--` that ended agentbox's flags, which is
+// what gives a command whose own first argument looks like a flag a way
+// through: `agentbox run -- mytool --root`.
+func stripFlagTerminator(cmd string, args []string) []string {
+	if takesInBoxArgs(cmd) && len(args) > 0 && args[0] == "--" {
+		return args[1:]
+	}
+	return args
+}
+
 func dispatch(opts *app.Options, cmd string, args []string) (int, error) {
-	// Subcommand-local flags.
-	var boolFlag = func(name string) bool {
-		for j, a := range args {
-			if a == name {
+	scan := flagScanLimit(cmd, args)
+	boolFlag := func(name string) bool {
+		for j := 0; j < scan; j++ {
+			if args[j] == name {
 				args = append(args[:j:j], args[j+1:]...)
+				scan--
 				return true
 			}
 		}
 		return false
 	}
-	var stringFlag = func(name string) string {
-		for j, a := range args {
-			if a == name && j+1 < len(args) {
-				v := args[j+1]
-				args = append(args[:j:j], args[j+2:]...)
-				return v
-			}
-			if strings.HasPrefix(a, name+"=") {
-				args = append(args[:j:j], args[j+1:]...)
-				return a[len(name)+1:]
-			}
-		}
-		return ""
-	}
 	if boolFlag("--json") {
 		opts.JSON = true
 	}
+	// --root is accepted after `run`/`shell` as well as before, because
+	// `agentbox run --root cmd` is how everyone writes it and silently
+	// forwarding it to the guest as an argument is a baffling failure.
+	if boolFlag("--root") {
+		opts.Root = true
+	}
+	args = stripFlagTerminator(cmd, args)
 
 	if cmd == "help" {
 		usage(os.Stdout)
 		return 0, nil
-	}
-	if cmd == "completion" {
-		if len(args) != 1 {
-			return 0, app.Usagef("completion requires a shell: bash, zsh, or fish")
-		}
-		return app.CmdCompletion(args[0])
-	}
-	if trustLenient[cmd] {
-		opts.TrustLenient = true
 	}
 
 	c, err := app.Resolve(opts)
@@ -361,74 +287,22 @@ func dispatch(opts *app.Options, cmd string, args []string) (int, error) {
 		return c.CmdRun(args, false)
 	case "shell":
 		return c.CmdRun(nil, true)
-	case "new":
-		if n := stringFlag("--name"); n != "" {
-			opts.Name = n
-		}
-		cmdErr = c.CmdNew()
-	case "attach":
-		return c.CmdAttach()
-	case "default":
-		if len(args) != 1 {
-			return 0, app.Usagef("default requires exactly one box name")
-		}
-		cmdErr = c.CmdDefault(args[0])
 	case "up":
 		cmdErr = c.CmdUp()
-	case "stop":
-		cmdErr = c.CmdStop()
 	case "down":
 		cmdErr = c.CmdDown()
-	case "restart":
-		cmdErr = c.CmdRestart()
 	case "status":
-		cmdErr = c.CmdStatus(boolFlag("--artifacts"))
-	case "ps":
-		cmdErr = c.CmdPs()
+		cmdErr = c.CmdStatus()
 	case "logs":
 		cmdErr = c.CmdLogs(boolFlag("--proxy"), boolFlag("--denied"), boolFlag("-f") || boolFlag("--follow"))
 	case "build":
 		cmdErr = c.CmdBuild(boolFlag("--no-cache"))
 	case "config":
 		cmdErr = c.CmdConfig(boolFlag("--origin"))
-	case "mounts":
-		cmdErr = c.CmdMounts()
-	case "masks":
-		cmdErr = c.CmdMasks(boolFlag("--verify"))
-	case "backends":
-		cmdErr = c.CmdBackends()
-	case "allow":
-		cmdErr = c.CmdAllow(args)
-	case "bundles":
-		_ = boolFlag("--list")
-		cmdErr = c.CmdBundles(stringFlag("--show"))
 	case "init":
-		cmdErr = c.CmdInit(stringFlag("--profile"))
-	case "ls":
-		all := boolFlag("--all")
-		_ = boolFlag("--project") // current project is the default scope
-		cmdErr = c.CmdLs(all, boolFlag("--artifacts"))
+		cmdErr = c.CmdInit()
 	case "rm":
-		removeState := boolFlag("--state")
-		deleteBranch := boolFlag("--delete-branch")
-		id := ""
-		if len(args) > 0 {
-			id = args[0]
-		}
-		cmdErr = c.CmdRm(id, removeState, deleteBranch)
-	case "prune":
-		cmdErr = c.CmdPrune(app.PruneOptions{
-			Idle:    boolFlag("--idle"),
-			Images:  boolFlag("--images"),
-			Boxes:   boolFlag("--boxes"),
-			Running: boolFlag("--running"),
-			State:   boolFlag("--state"),
-			Apply:   boolFlag("--apply"),
-		})
-	case "doctor":
-		cmdErr = c.CmdDoctor()
-	case "trust":
-		cmdErr = c.CmdTrust(boolFlag("--show"), boolFlag("--revoke"))
+		cmdErr = c.CmdRm(boolFlag("--keep-image"))
 	case "version":
 		cmdErr = c.CmdVersion()
 	default:
@@ -450,40 +324,45 @@ usage:
   agentbox [flags] [COMMAND] [ARGS...]
   agentbox [flags] [--] COMMAND-IN-BOX [ARGS...]
 
+There is one box per workspace root: cd into a project and you are in its box.
+For a second box, make a second root — `+"`git worktree add ../feature`"+` gets its
+own box, on its own branch, for free.
+
 Commands not in the reserved set run inside the box. Reserved:
-  run shell new attach default up stop down restart status ps logs build
-  config mounts masks backends allow bundles init ls rm prune doctor trust
-  completion version
+  run shell up down status logs build config init rm version help
+
+  run CMD...      run a command in the box
+  shell           interactive shell in the box
+  up              create and start the box; run nothing
+  down            stop and remove the box, keeping its home and identity
+  rm              remove the box and everything it holds, image included
+  status          backend, tier, egress, masking, and any config drift
+  logs            box logs (--proxy for the egress proxy, --denied for refusals)
+  build           build or rebuild the image (--no-cache)
+  config          the effective merged configuration (--origin to attribute it)
+  init            scaffold agentbox.toml and .agentignore
+  version         agentbox and backend versions
 
 Key flags:
   -C DIR          resolve the workspace as if from DIR
   -w DIR          override workspace-root detection
-  -n NAME         address a box by name or ordinal alias
-  --new           create an additional box
-  --all           apply stop/down/status to every box in the project
-  --tree-mode M   shared | worktree | copy (overrides [workspace].tree_mode)
-  -p NAME         apply a profile overlay
+  -c FILE         use FILE as the workspace config layer
+  --no-config     built-in defaults only
   -b NAME         select a backend (never below the isolation floor)
   --min-isolation T  raise the floor for this invocation
-  --network MODE  none | proxy | open
-  --offline       same as --network none
-  --dry-run       print the plan; change nothing
+  --force-isolation T  lower it; recorded, and warned on every invocation
+  --network MODE  off | proxy | open
+  -e KEY=VAL      set a variable in the box
+  -E KEY          pass a host variable through
+  --rebuild       rebuild the image before starting
+  --recreate      recreate the box from current configuration
+  --root          run as uid 0 inside the box
+  --no-mask       disable secret masking for this invocation (warns, loudly)
+  --dry-run       print the full plan, including every mask; change nothing
   --json          machine-readable output where supported
+  -q / -v         quieter / more verbose diagnostics
 
-Seeing what is held:
-  agentbox ls --artifacts        every box and what it is holding, plus what
-                                 nothing holds (--all spans projects)
-  agentbox status --artifacts    the same, for one box, in detail
-
-Reclaiming disk:
-  agentbox prune            report what agentbox can reclaim; removes nothing
-  agentbox prune --apply    reclaim it (--images to include built images)
-
-  Boxes are only candidates with --boxes, which widens in named steps:
-    --boxes     stopped boxes: the guest, its networks, its tree
-    --running   ... also boxes that are running
-    --state     ... also each box's persistent home
-  Branches are never deleted by prune, at any combination of flags.
-
+Configuration layers, lowest first: built-in, user
+($XDG_CONFIG_HOME/agentbox/config.toml), workspace (agentbox.toml), flags.
 `)
 }

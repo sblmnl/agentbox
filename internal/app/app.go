@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/sblmnl/agentbox/internal/backend"
@@ -28,7 +27,6 @@ const (
 	ExUsage       = 64
 	ExUnavailable = 69 // no backend satisfies the isolation floor
 	ExSoftware    = 70
-	ExNoPerm      = 77 // workspace config not trusted
 	ExConfig      = 78 // configuration invalid, including backend-scope violations
 )
 
@@ -57,11 +55,6 @@ func Softwaref(format string, a ...any) *ExitError {
 type Options struct {
 	Directory      string // -C
 	Workspace      string // -w
-	Name           string // -n
-	New            bool
-	All            bool
-	TreeMode       string
-	Profile        string // -p
 	ConfigFile     string // -c
 	NoConfig       bool
 	Backend        string // -b
@@ -70,10 +63,9 @@ type Options struct {
 	Env            []string // -e KEY=VAL
 	EnvPassthrough []string // -E KEY
 	NetworkMode    string
-	Offline        bool
 	Rebuild        bool
 	Recreate       bool
-	Root           bool
+	Root           bool // --root: exec as uid 0 inside the box
 	NoMask         bool
 	DryRun         bool
 	JSON           bool
@@ -81,18 +73,10 @@ type Options struct {
 	Verbose        bool
 	Timeout        int
 
-	// TrustLenient downgrades the workspace-trust refusal to a
-	// warning. Set by the CLI for inspection commands — reviewing an
-	// untrusted config is exactly what they are for — never from config.
-	TrustLenient bool
-
 	// Test seams.
 	StateRoot     string
 	Availabilties []backend.Availability // nil = probe the host
 	Stderr        *os.File
-	// BoxLiveness overrides the per-box runtime probe prune's teardown uses
-	// to decide what it may touch (nil = ask the backend).
-	BoxLiveness func(instance string) (running bool, detail string)
 }
 
 // Ctx is everything resolved before a command runs.
@@ -105,6 +89,29 @@ type Ctx struct {
 	Cfg       *config.Result
 	Store     *state.Store
 	Stderr    *os.File
+
+	// warnedPlan makes emitPlanWarnings idempotent. Creating a box builds a
+	// plan inside selectBox and the caller then builds its own, so without
+	// this the first invocation says everything twice.
+	warnedPlan bool
+}
+
+// emitPlanWarnings prints a plan's warnings to stderr.
+//
+// Every command that builds a plan calls this, not just the one that creates
+// the box. Warnings about a plan describe the box you are about to enter --
+// a mask mode that fell back to a weaker one, an agent whose egress is open
+// but which was never installed -- and a warning that fires only on the
+// invocation that happened to create the box is a warning the user will
+// almost never see, because the interesting edits come afterwards.
+func (c *Ctx) emitPlanWarnings(p *Plan) {
+	if c.warnedPlan {
+		return
+	}
+	c.warnedPlan = true
+	for _, w := range p.Warnings {
+		fmt.Fprintln(c.Stderr, "warning: "+w)
+	}
 }
 
 // Resolve builds the context: workspace detection, configuration load, flag
@@ -133,10 +140,8 @@ func Resolve(opts *Options) (*Ctx, error) {
 
 	res, err := config.Load(config.LoadOptions{
 		WorkspaceRoot: real,
-		ProfileName:   opts.Profile,
 		ConfigFile:    opts.ConfigFile,
 		NoConfig:      opts.NoConfig,
-		Environ:       os.Environ(),
 	})
 	if err != nil {
 		return nil, asConfigErr(err)
@@ -144,15 +149,8 @@ func Resolve(opts *Options) (*Ctx, error) {
 
 	// Flag overlay.
 	flags := map[string]any{}
-	netMode := opts.NetworkMode
-	if opts.Offline {
-		netMode = "none"
-	}
-	if netMode != "" {
-		setPath(flags, "network.mode", netMode)
-	}
-	if opts.TreeMode != "" {
-		setPath(flags, "workspace.tree_mode", opts.TreeMode)
+	if opts.NetworkMode != "" {
+		setPath(flags, "network.mode", opts.NetworkMode)
 	}
 	if opts.MinIsolation != "" {
 		// MAY raise the floor, MUST NOT lower it.
@@ -188,20 +186,16 @@ func Resolve(opts *Options) (*Ctx, error) {
 		fmt.Fprintln(stderr, "warning: network mode \"open\": the box has ordinary network access; the egress allowlist and audit trail do not apply")
 	}
 
-	ctx := &Ctx{
+	return &Ctx{
 		Opts:      opts,
 		StartDir:  startDir,
 		Workspace: real,
-		Key:       identity.ProjectKey(real),
+		Key:       identity.BoxKey(real),
 		Slug:      identity.SanitizeSlug(filepath.Base(real)),
 		Cfg:       res,
 		Store:     state.Open(opts.StateRoot),
 		Stderr:    stderr,
-	}
-	if err := ctx.checkWorkspaceTrust(); err != nil {
-		return nil, err
-	}
-	return ctx, nil
+	}, nil
 }
 
 func asConfigErr(err error) error {
@@ -241,25 +235,6 @@ func (c *Ctx) Availabilities() []backend.Availability {
 		return c.Opts.Availabilties
 	}
 	return backend.Probe()
-}
-
-// ResolveBoxName maps -n (name or ordinal alias) to an instance name.
-func (c *Ctx) ResolveBoxName() (string, error) {
-	n := c.Opts.Name
-	if n == "" {
-		return "", nil
-	}
-	if ord, err := strconv.Atoi(n); err == nil {
-		inst, err := c.Store.ResolveOrdinal(c.Key, ord)
-		if err != nil {
-			return "", Usagef("%v", err)
-		}
-		return inst, nil
-	}
-	if !identity.ValidInstanceName(n) {
-		return "", Usagef("invalid instance name %q (must match [a-z0-9][a-z0-9_-]{0,31})", n)
-	}
-	return n, nil
 }
 
 // Verbosef prints a diagnostic when -v is set.

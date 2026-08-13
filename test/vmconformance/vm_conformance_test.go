@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -54,19 +55,21 @@ func gate(t *testing.T) {
 	if os.Getenv("AGENTBOX_VM_CONFORMANCE") != "1" {
 		t.Skip("vm conformance requires AGENTBOX_VM_CONFORMANCE=1 (KVM + kata + root); CI must fail on this skip")
 	}
-	out, _, code := agentbox(t, t.TempDir(), "backends", "--json")
+	out, _, code := agentbox(t, t.TempDir(), "version", "--json")
 	if code != 0 {
-		t.Fatalf("agentbox backends failed: %s", out)
+		t.Fatalf("agentbox version failed: %s", out)
 	}
-	var avs []struct {
-		Name      string `json:"name"`
-		Available bool   `json:"available"`
-		Reason    string `json:"reason"`
+	var info struct {
+		Backends []struct {
+			Name      string `json:"name"`
+			Available bool   `json:"available"`
+			Reason    string `json:"reason"`
+		} `json:"backends"`
 	}
-	if err := json.Unmarshal([]byte(out), &avs); err != nil {
-		t.Fatalf("backends --json: %v\n%s", err, out)
+	if err := json.Unmarshal([]byte(out), &info); err != nil {
+		t.Fatalf("version --json: %v\n%s", err, out)
 	}
-	for _, av := range avs {
+	for _, av := range info.Backends {
 		if av.Name == "vm" {
 			if !av.Available {
 				t.Fatalf("AGENTBOX_VM_CONFORMANCE=1 but the vm backend is unavailable: %s", av.Reason)
@@ -86,14 +89,18 @@ func ws(t *testing.T, config string, files map[string]string) string {
 		t.Fatal(err)
 	}
 	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		full := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	stateRoot := t.TempDir()
 	stateRoots[dir] = stateRoot
 	t.Cleanup(func() {
-		_, _, _ = agentbox(t, dir, "down", "--all")
+		_, _, _ = agentbox(t, dir, "rm")
 		delete(stateRoots, dir)
 	})
 	return dir
@@ -132,7 +139,7 @@ ref = "ubuntu:24.04"
 [security]
 min_isolation = "vm"
 [network]
-mode = "none"
+mode = "off"
 `
 
 func TestExitCodeFidelity(t *testing.T) {
@@ -189,22 +196,22 @@ allow = ["api.anthropic.com"]
 	}
 }
 
+// Two boxes means two workspace roots -- which is how a project gets a second
+// box now (`git worktree add`). They must run concurrently without disturbing
+// each other, and tearing one down must not touch the other.
 func TestConcurrentGuests(t *testing.T) {
 	gate(t)
-	dir := ws(t, baseConfig, nil)
-	for _, name := range []string{"alpha", "beta"} {
-		if _, errOut, code := agentbox(t, dir, "new", "--name", name); code != 0 {
-			t.Fatalf("creating %s: %s", name, errOut)
-		}
-	}
+	alpha := ws(t, baseConfig, nil)
+	beta := ws(t, baseConfig, nil)
+
 	var wg sync.WaitGroup
 	results := map[string]string{}
 	var mu sync.Mutex
-	for _, name := range []string{"alpha", "beta"} {
+	for name, dir := range map[string]string{"alpha": alpha, "beta": beta} {
 		wg.Add(1)
-		go func(name string) {
+		go func(name, dir string) {
 			defer wg.Done()
-			out, _, code := agentbox(t, dir, "-n", name, "run", "sh", "-c", "uname -r; hostname")
+			out, _, code := agentbox(t, dir, "run", "sh", "-c", "uname -r; hostname")
 			mu.Lock()
 			defer mu.Unlock()
 			if code != 0 {
@@ -212,7 +219,7 @@ func TestConcurrentGuests(t *testing.T) {
 			} else {
 				results[name] = out
 			}
-		}(name)
+		}(name, dir)
 	}
 	wg.Wait()
 	for name, res := range results {
@@ -221,13 +228,13 @@ func TestConcurrentGuests(t *testing.T) {
 		}
 	}
 
-	// Stop one; the other keeps serving.
-	if _, errOut, code := agentbox(t, dir, "-n", "alpha", "stop"); code != 0 {
-		t.Fatalf("stop alpha: %s", errOut)
+	// Take one down; the other keeps serving.
+	if _, errOut, code := agentbox(t, alpha, "down"); code != 0 {
+		t.Fatalf("down alpha: %s", errOut)
 	}
 	time.Sleep(2 * time.Second)
-	if out, _, code := agentbox(t, dir, "-n", "beta", "run", "echo", "still-alive"); code != 0 || !strings.Contains(out, "still-alive") {
-		t.Fatalf("beta disturbed by stopping alpha: code %d, out %q", code, out)
+	if out, _, code := agentbox(t, beta, "run", "echo", "still-alive"); code != 0 || !strings.Contains(out, "still-alive") {
+		t.Fatalf("beta disturbed by taking alpha down: code %d, out %q", code, out)
 	}
 }
 
@@ -244,7 +251,7 @@ ref = "ubuntu:24.04"
 min_isolation = "vm"
 mask_mode = "filter"
 [network]
-mode = "none"
+mode = "off"
 `
 	dir := ws(t, filterConfig, map[string]string{
 		".agentignore":  ".env\n*.pem\nsecrets/\n",
@@ -258,13 +265,25 @@ mode = "none"
 
 	// Masked paths do not exist in the guest: not readable, not listed —
 	// including for guest root, because enforcement is host-side.
-	out, _, _ := agentbox(t, dir, "run", "--root", "sh", "-c",
-		"ls -a /workspace; cat /workspace/.env 2>&1; cat /workspace/secrets/token 2>&1; true")
-	if strings.Contains(out, "exfiltrate-me") || strings.Contains(out, "tok\n") {
-		t.Fatal("masked content readable through the filtered share")
+	//
+	// The listing is asserted on its own rather than mixed with the read
+	// attempts: a failed `cat /workspace/.env` prints the path back in its
+	// error message, so a naive substring check over the combined output
+	// reports a perfectly masked box as leaking.
+	out, _, _ := agentbox(t, dir, "run", "--root", "sh", "-c", "ls -a /workspace")
+	for _, name := range []string{".env", "secrets"} {
+		if slices.Contains(strings.Fields(out), name) {
+			t.Fatalf("masked name %q must be absent from listings, got:\n%s", name, out)
+		}
 	}
-	if strings.Contains(out, ".env") || strings.Contains(out, "secrets") {
-		t.Fatalf("masked names must be absent from listings, got:\n%s", out)
+	if !slices.Contains(strings.Fields(out), "main.go") {
+		t.Fatalf("unmasked files must still be listed, got:\n%s", out)
+	}
+
+	out, _, _ = agentbox(t, dir, "run", "--root", "sh", "-c",
+		"cat /workspace/.env 2>&1; cat /workspace/secrets/token 2>&1; true")
+	if strings.Contains(out, "exfiltrate-me") || strings.Contains(out, "tok\n") {
+		t.Fatalf("masked content readable through the filtered share:\n%s", out)
 	}
 
 	// Guarantee: a matching file created after box start is masked. The
@@ -290,15 +309,39 @@ mode = "none"
 
 	// Guarantee: no tmpfs size cap anywhere in the masked view — a
 	// large write to an unmasked path passes straight through.
-	out, _, code := agentbox(t, dir, "run", "sh", "-c",
+	out, stderr, code := agentbox(t, dir, "run", "sh", "-c",
 		"dd if=/dev/zero of=/workspace/big.bin bs=1M count=8 2>&1 && echo OK")
 	if code != 0 || !strings.Contains(out, "OK") {
 		t.Fatalf("large write through the filtered share failed:\n%s", out)
 	}
 
-	// `masks --verify` asserts absence (not emptiness) under filter mode.
-	out, stderr, code := agentbox(t, dir, "masks", "--verify")
+	// The host-side view of the mask set must agree with what the guest
+	// actually sees, which the checks above established directly. `--dry-run`
+	// is where that view is published now that `masks` is gone, so assert the
+	// two describe the same thing rather than trusting them separately.
+	out, stderr, code = agentbox(t, dir, "--dry-run", "--json")
 	if code != 0 {
-		t.Fatalf("masks --verify failed: %d\n%s\n%s", code, out, stderr)
+		t.Fatalf("--dry-run failed: %d\n%s\n%s", code, out, stderr)
+	}
+	var plan struct {
+		MaskMode string `json:"mask_mode"`
+		Masks    struct {
+			Entries []struct {
+				Path string `json:"path"`
+			} `json:"entries"`
+		} `json:"masks"`
+	}
+	if err := json.Unmarshal([]byte(out[strings.Index(out, "{"):]), &plan); err != nil {
+		t.Fatalf("--dry-run did not emit a parseable plan: %v\n%s", err, out)
+	}
+	if plan.MaskMode != "filter" {
+		t.Fatalf("mask_mode = %q, want filter", plan.MaskMode)
+	}
+	var masked []string
+	for _, e := range plan.Masks.Entries {
+		masked = append(masked, e.Path)
+	}
+	if !slices.Contains(masked, ".env") {
+		t.Fatalf(".env is hidden from the guest but absent from the published mask set %v", masked)
 	}
 }

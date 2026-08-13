@@ -119,19 +119,22 @@ jobs:
           set -x
           ./agentbox help
           ./agentbox version --json
-          ./agentbox completion bash > /dev/null
-          ./agentbox completion zsh  > /dev/null
-          ./agentbox completion fish > /dev/null
           mkdir -p /tmp/smoke && cd /tmp/smoke && git init -q .
           $GITHUB_WORKSPACE/agentbox init
-          $GITHUB_WORKSPACE/agentbox doctor || true   # docker may be absent
           $GITHUB_WORKSPACE/agentbox config --origin > /dev/null
-          $GITHUB_WORKSPACE/agentbox trust --show
-          # Untrusted hooks must be refused with exit 77.
+          $GITHUB_WORKSPACE/agentbox status
+          # --dry-run is the inspection surface: it must produce the whole
+          # plan, including the mask set, without a backend on the host.
+          $GITHUB_WORKSPACE/agentbox --dry-run --json | grep -q '"mask_mode"'
+          # A key removed in the MVP schema must be a hard error (78), never
+          # silently ignored.
           printf 'version = 1\n[hooks]\npre_up = ["true"]\n' > agentbox.toml
-          rc=0; $GITHUB_WORKSPACE/agentbox run true || rc=$?
-          test "$rc" = "77"
-          $GITHUB_WORKSPACE/agentbox trust
+          rc=0; $GITHUB_WORKSPACE/agentbox config || rc=$?
+          test "$rc" = "78"
+          # A workspace config that weakens a security key must say so on
+          # every invocation.
+          printf 'version = 1\n[network]\nmode = "open"\n' > agentbox.toml
+          $GITHUB_WORKSPACE/agentbox config 2>&1 >/dev/null | grep -q "network.mode"
 
   # Every other test in this file asserts over the *text* of the generated
   # Dockerfile, which can never catch upstream drift: a recipe that names a

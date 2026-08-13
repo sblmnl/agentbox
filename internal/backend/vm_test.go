@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sblmnl/agentbox/internal/mask"
 	"github.com/sblmnl/agentbox/internal/netpol"
@@ -65,14 +63,22 @@ func (f *fakeEngine) call(verb string) []string {
 	return nil
 }
 
+// callMatching returns the first recorded call whose joined form contains sub.
+func (f *fakeEngine) callMatching(sub string) []string {
+	for _, c := range f.calls {
+		if strings.Contains(strings.Join(c, " "), sub) {
+			return c
+		}
+	}
+	return nil
+}
+
 func testVM(t *testing.T, fake *fakeEngine, canMount bool) (*VMBackend, *[]string) {
 	t.Helper()
-	v := NewVMBackend("docker", "kata", t.TempDir())
+	v := NewVMBackend("docker/kata", t.TempDir())
 	v.Runner = fake.runner
 	v.canMountView = func() bool { return canMount }
-	// Unit tests must not depend on the host's vsock modules, and must not
-	// sit out the forwarder's start-up grace.
-	v.waitReady = func(string, time.Duration) error { return nil }
+	v.hostResolvers = func() ([]string, error) { return []string{"192.0.2.53"}, nil }
 	v.probeGrace = 0
 	var warnings []string
 	v.Warnf = func(format string, a ...any) { warnings = append(warnings, fmt.Sprintf(format, a...)) }
@@ -81,7 +87,7 @@ func testVM(t *testing.T, fake *fakeEngine, canMount bool) (*VMBackend, *[]strin
 
 func proxySpec(t *testing.T, name string) *BoxSpec {
 	t.Helper()
-	return &BoxSpec{
+	s := &BoxSpec{
 		BoxID:        "box-" + name,
 		ResourceName: "agentbox-" + name,
 		ImageRef:     "agentbox/dev:abc",
@@ -89,17 +95,20 @@ func proxySpec(t *testing.T, name string) *BoxSpec {
 		Mount:        "/workspace",
 		Workdir:      "/workspace",
 		Policy:       &netpol.Policy{Mode: netpol.ModeProxy, Allow: []string{"api.anthropic.com"}, Audit: true},
-		StateDir:     t.TempDir(), // the box's vsock token lands here
+		StateDir:     t.TempDir(),
 		Memory:       "8g",
 		CPUs:         4,
 		Pids:         4096,
 		TmpfsSize:    "4g",
 		Nofile:       65536,
+		ProxyAddr:    "100.64.1.2",
 	}
+	s.SetProxyConfigPath(filepath.Join(t.TempDir(), "squid.conf"))
+	return s
 }
 
 func TestVMCreateFlags(t *testing.T) {
-	fake := &fakeEngine{outputs: map[string]string{"network inspect": "10.89.4.1"}}
+	fake := &fakeEngine{}
 	v, _ := testVM(t, fake, false)
 
 	spec := proxySpec(t, "t1")
@@ -129,12 +138,9 @@ func TestVMCreateFlags(t *testing.T) {
 		"--mount type=bind,src=/src/tree,dst=/workspace",
 		"--mount type=bind,src=/dev/null,dst=/workspace/.env,readonly",
 		"--tmpfs /workspace/secrets:noexec,size=1m",
-		// Egress leaves over vsock, so the proxy is on loopback and the
-		// forwarder binary is mounted in to carry it.
-		"-e HTTPS_PROXY=http://127.0.0.1:3128",
-		"dst=" + guestHelperPath + ",readonly",
-		"-e AGENTBOX_VSOCK_TOKEN=",
-		"vsockfwd",
+		// The proxy is addressed by IP: container-name DNS does not resolve
+		// from inside a VM guest.
+		"-e HTTPS_PROXY=http://100.64.1.2:3128",
 		"sleep infinity",
 	} {
 		if !strings.Contains(joined, want) {
@@ -150,10 +156,113 @@ func TestVMCreateFlags(t *testing.T) {
 	}
 }
 
+// The guest must never be handed a proxy URL naming the sidecar container.
+// Docker publishes its embedded resolver at 127.0.0.11 inside the network
+// namespace, and a VM guest's loopback is its own, so a name would simply
+// fail to resolve and every request would die at DNS.
+func TestVMProxyIsAddressedByIPNotName(t *testing.T) {
+	fake := &fakeEngine{}
+	v, _ := testVM(t, fake, false)
+	spec := proxySpec(t, "byip")
+	if err := v.Create(spec); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(fake.call("create"), " ")
+	if strings.Contains(joined, spec.ResourceName+"-proxy:3128") {
+		t.Errorf("proxy addressed by container name; a VM guest cannot resolve it:\n%s", joined)
+	}
+	if !strings.Contains(joined, "http://"+spec.ProxyAddr+":3128") {
+		t.Errorf("proxy not addressed by pinned IP:\n%s", joined)
+	}
+}
+
+// The sidecar must be pinned to the address baked into the guest's
+// environment, or a restart would renumber it and the box would lose egress.
+func TestVMSidecarPinnedToProxyAddr(t *testing.T) {
+	fake := &fakeEngine{}
+	v, _ := testVM(t, fake, false)
+	spec := proxySpec(t, "pin")
+	if err := v.Create(spec); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := fake.callMatching(spec.ResourceName + "-proxy")
+	if sidecar == nil {
+		t.Fatal("proxy mode created no sidecar")
+	}
+	joined := strings.Join(sidecar, " ")
+	if !strings.Contains(joined, "--ip "+spec.ProxyAddr) {
+		t.Errorf("sidecar is not pinned to %s:\n%s", spec.ProxyAddr, joined)
+	}
+}
+
+// Open mode is the one mode where the guest resolves names itself, and it
+// cannot use the engine's embedded resolver. Note that --dns does not fix
+// this: on a user-defined network the engine still writes 127.0.0.11 into the
+// container's resolv.conf and only redirects the embedded resolver's upstream.
+func TestVMOpenModeCarriesItsOwnResolvConf(t *testing.T) {
+	fake := &fakeEngine{}
+	v, _ := testVM(t, fake, false)
+	spec := proxySpec(t, "open")
+	spec.Policy = &netpol.Policy{Mode: netpol.ModeOpen}
+	if err := v.Create(spec); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(fake.call("create"), " ")
+	if !strings.Contains(joined, "dst=/etc/resolv.conf,readonly") {
+		t.Fatalf("open mode must bind-mount a generated resolv.conf:\n%s", joined)
+	}
+	blob, err := os.ReadFile(filepath.Join(spec.StateDir, "resolv.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(blob), "nameserver 192.0.2.53") {
+		t.Errorf("generated resolv.conf should carry the host's upstream: %q", blob)
+	}
+	// Open mode has no proxy, so nothing should be pointed at one.
+	if strings.Contains(joined, "HTTPS_PROXY") {
+		t.Errorf("open mode must not set proxy variables:\n%s", joined)
+	}
+}
+
+// A host whose only resolver is a loopback stub cannot serve open mode, and
+// saying so beats a box that starts and then resolves nothing.
+func TestVMOpenModeWithoutUsableResolverFails(t *testing.T) {
+	fake := &fakeEngine{}
+	v, _ := testVM(t, fake, false)
+	v.hostResolvers = func() ([]string, error) { return nil, fmt.Errorf("only 127.0.0.53") }
+	spec := proxySpec(t, "nores")
+	spec.Policy = &netpol.Policy{Mode: netpol.ModeOpen}
+	err := v.Create(spec)
+	if err == nil {
+		t.Fatal("open mode with no usable resolver must fail rather than start a box that cannot resolve")
+	}
+	if !strings.Contains(err.Error(), "nameserver") {
+		t.Errorf("error should explain the resolver problem: %v", err)
+	}
+}
+
+// Off mode gets no proxy and no route: nothing to configure, nothing to leak.
+func TestVMOffModeHasNoProxyAndNoResolver(t *testing.T) {
+	fake := &fakeEngine{}
+	v, _ := testVM(t, fake, false)
+	spec := proxySpec(t, "off")
+	spec.Policy = &netpol.Policy{Mode: netpol.ModeOff}
+	if err := v.Create(spec); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(fake.call("create"), " ")
+	if strings.Contains(joined, "HTTPS_PROXY") || strings.Contains(joined, "resolv.conf") {
+		t.Errorf("off mode must configure neither proxy nor resolver:\n%s", joined)
+	}
+	if fake.callMatching(spec.ResourceName+"-proxy") != nil {
+		t.Error("off mode must not create a proxy sidecar")
+	}
+}
+
 func TestVMGuestRootAccepted(t *testing.T) {
 	// The container backend rejects GuestRoot; the vm tier is
 	// exactly where root is safe with respect to masking.
-	fake := &fakeEngine{outputs: map[string]string{"network inspect": "10.89.4.1"}}
+	fake := &fakeEngine{}
 	v, _ := testVM(t, fake, false)
 	spec := proxySpec(t, "t2")
 	spec.GuestRoot = true
@@ -195,187 +304,183 @@ func TestVMSetupShareNoMasksIsQuiet(t *testing.T) {
 // Start checks it before going anywhere near the guest.
 const runningBox = "true 4242 running 0"
 
+// The guest must not be started before its proxy: a running guest behind a
+// dead proxy fails every network call in a way that reads like a bug in the
+// user's own code.
 func TestVMStartBringsProxyUpFirst(t *testing.T) {
-	fake := &fakeEngine{outputs: map[string]string{
-		"network inspect": "127.0.0.1",
-		"inspect":         runningBox,
-	}}
+	fake := &fakeEngine{outputs: map[string]string{"inspect": runningBox}}
 	v, _ := testVM(t, fake, false)
 
-	// An in-process proxyd serves the spool; the pidfile carries our own
-	// pid so EnsureDaemon does not spawn anything.
-	if err := os.MkdirAll(netpol.ProxydDir(v.StateRoot), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(netpol.PidfilePath(v.StateRoot), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p := &netpol.Proxyd{SpoolDir: netpol.SpoolDir(v.StateRoot), Logf: t.Logf, IdleExit: time.Hour}
-	go p.Run(ctx)
-
 	spec := proxySpec(t, "t5")
-	spec.StateDir = filepath.Join(v.StateRoot, "boxdir")
 	if err := v.Start(spec); err != nil {
 		t.Fatal(err)
 	}
-	// Start returned, so WaitListener saw the listener accept — the guest
-	// was started only after its proxy was reachable.
-	if fake.call("start") == nil {
-		t.Fatal("engine start was not invoked")
+	var order []string
+	for _, c := range fake.calls {
+		if len(c) == 2 && c[0] == "start" {
+			order = append(order, c[1])
+		}
 	}
-	ls, err := netpol.ReadListenerSpec(v.StateRoot, spec.ResourceName)
-	if err != nil {
-		t.Fatal(err)
+	if len(order) < 2 {
+		t.Fatalf("expected the proxy and the guest to be started, got %v", order)
 	}
-	if ls.Allow[0] != "api.anthropic.com" {
-		t.Fatalf("listener spec carries wrong policy: %+v", ls)
-	}
-	// The vm tier attaches over vsock: the box is identified by a token,
-	// and binds no address of its own.
-	if ls.Token == "" || ls.Addr != "" {
-		t.Fatalf("vm listener must be token-attached with no bound address: %+v", ls)
-	}
-
-	// Stop retracts the listener so the gateway address is not held.
-	if err := v.Stop(spec.ResourceName); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := netpol.ReadListenerSpec(v.StateRoot, spec.ResourceName); !os.IsNotExist(err) {
-		t.Fatalf("listener spec should be retracted on stop, got %v", err)
+	if order[0] != spec.ResourceName+"-proxy" || order[1] != spec.ResourceName {
+		t.Errorf("proxy must start before the guest, got %v", order)
 	}
 }
 
-// startWithLiveProxyd runs Start against an in-process proxyd, so the host-side
-// listener genuinely comes up and only the guest-side probe is in question.
-// It returns the backend's warnings, which are the observable half of every
-// path that declines to fail the box.
-func startWithLiveProxyd(t *testing.T, fake *fakeEngine, name string) (*[]string, error) {
-	t.Helper()
-	v, warnings := testVM(t, fake, false)
-	if err := os.MkdirAll(netpol.ProxydDir(v.StateRoot), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(netpol.PidfilePath(v.StateRoot), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	p := &netpol.Proxyd{SpoolDir: netpol.SpoolDir(v.StateRoot), Logf: t.Logf, IdleExit: time.Hour}
-	go p.Run(ctx)
-
-	spec := proxySpec(t, name)
-	spec.StateDir = filepath.Join(v.StateRoot, "boxdir")
-	return warnings, v.Start(spec)
-}
-
-// A guest that cannot open a connection to its proxy must fail the box at
-// start, naming the blocked path. Letting it come up means every network call
-// in the guest hangs until it times out, with nothing on the host to show why.
-func TestVMStartRefusesUnreachableProxy(t *testing.T) {
-	for _, code := range []string{"7", "28"} { // refused, timed out
-		t.Run("curl"+code, func(t *testing.T) {
-			// The engine entered the box and the probe ran: the curl exit
-			// code arrives on stdout of an exec that itself succeeded.
-			fake := &fakeEngine{
-				outputs: map[string]string{"network inspect": "127.0.0.1", "inspect": runningBox},
-				results: map[string]fakeResult{"exec": {stdout: code}},
-			}
-			_, err := startWithLiveProxyd(t, fake, "unreach"+code)
-			if err == nil {
-				t.Fatal("Start accepted a box whose guest cannot reach its proxy")
-			}
-			for _, want := range []string{"cannot reach its egress proxy", "forwarder", "CGO_ENABLED=0"} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("error does not mention %q: %v", want, err)
-				}
-			}
-		})
-	}
-}
-
-// A probe that cannot run is not evidence of a blocked path: a user-supplied
-// image without curl must not be refused on the strength of a missing tool.
-// The engine entered the box and the script said so, both when the exit code
-// reaches us through stdout and when the guest shell exits 127 directly.
-func TestVMStartProbeUnavailableIsNotRefusal(t *testing.T) {
-	t.Run("reported", func(t *testing.T) {
-		fake := &fakeEngine{outputs: map[string]string{
-			"network inspect": "127.0.0.1",
-			"inspect":         runningBox,
-			"exec":            "127", // command -v curl failed
-		}}
-		warnings, err := startWithLiveProxyd(t, fake, "noprobe")
-		if err != nil {
-			t.Fatalf("missing probe tool must not fail the box: %v", err)
-		}
-		if len(*warnings) != 0 {
-			t.Errorf("a missing probe tool is not worth warning about; got %v", *warnings)
-		}
-	})
-	t.Run("exit127", func(t *testing.T) {
-		fake := &fakeEngine{
-			outputs: map[string]string{"network inspect": "127.0.0.1", "inspect": runningBox},
-			results: map[string]fakeResult{"exec": {code: 127}},
-		}
-		warnings, err := startWithLiveProxyd(t, fake, "noprobe127")
-		if err != nil {
-			t.Fatalf("missing probe tool must not fail the box: %v", err)
-		}
-		if len(*warnings) != 0 {
-			t.Errorf("a missing probe tool is not worth warning about; got %v", *warnings)
-		}
-	})
-}
-
-// An engine that cannot run the probe at all is a different thing from a guest
-// with no curl: the check that exists to catch silently-broken egress did not
-// run. That must not pass as success — the box comes up, loudly.
-func TestVMStartProbeEngineFailureWarns(t *testing.T) {
+// An unreachable proxy is a box with no egress, not a box with widened
+// egress, so it warns rather than failing -- but it must never be silent.
+func TestVMStartWarnsOnUnreachableProxy(t *testing.T) {
 	fake := &fakeEngine{
-		outputs: map[string]string{"network inspect": "127.0.0.1", "inspect": runningBox},
-		results: map[string]fakeResult{"exec": {
-			code:   125,
-			stderr: "Error: the handler does not support exec",
-		}},
+		outputs: map[string]string{"inspect": runningBox},
+		results: map[string]fakeResult{"exec": {code: 1}},
 	}
-	warnings, err := startWithLiveProxyd(t, fake, "execfail")
-	if err != nil {
-		t.Fatalf("an unrunnable probe is diagnostic and must not fail the box: %v", err)
+	v, warnings := testVM(t, fake, false)
+	if err := v.Start(proxySpec(t, "unreach")); err != nil {
+		t.Fatalf("an unreachable proxy must not fail the box: %v", err)
 	}
-	if len(*warnings) != 1 {
-		t.Fatalf("an unverified egress path must warn exactly once; got %v", *warnings)
-	}
-	for _, want := range []string{"could not verify", "egress proxy", "the handler does not support exec"} {
-		if !strings.Contains((*warnings)[0], want) {
-			t.Errorf("warning does not mention %q: %s", want, (*warnings)[0])
-		}
+	joined := strings.Join(*warnings, "\n")
+	if !strings.Contains(joined, "cannot reach its egress proxy") {
+		t.Errorf("expected a warning about the unreachable proxy, got: %v", *warnings)
 	}
 }
 
-// `start` exiting 0 proves the runtime launched, not that the guest stayed up.
-// A guest that aborts while booting must be named here, with its log, rather
-// than surfacing later as an exec error against a box the engine calls exited.
-func TestVMStartRefusesDeadGuest(t *testing.T) {
-	fake := &fakeEngine{outputs: map[string]string{
-		"network inspect": "127.0.0.1",
-		"inspect":         "false 0 exited 139",
-		"logs":            "thread 'main' panicked at vstate.rs:447: Error creating the Kvm object",
-	}}
-	_, err := startWithLiveProxyd(t, fake, "deadguest")
+// A probe that could not run at all (no bash in a custom image) is a
+// different fact from a proxy that is not answering, and saying the second
+// when the first is true sends the user debugging a healthy sidecar.
+func TestVMStartDistinguishesUnrunnableProbe(t *testing.T) {
+	fake := &fakeEngine{
+		outputs: map[string]string{"inspect": runningBox},
+		results: map[string]fakeResult{"exec": {code: 127}},
+	}
+	v, warnings := testVM(t, fake, false)
+	if err := v.Start(proxySpec(t, "noprobe")); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(*warnings, "\n")
+	if !strings.Contains(joined, "could not verify") {
+		t.Errorf("an unrunnable probe must say so, got: %v", *warnings)
+	}
+	if strings.Contains(joined, "cannot reach its egress proxy") {
+		t.Errorf("an unrunnable probe must not be reported as an unreachable proxy: %v", *warnings)
+	}
+}
+
+// The probe must use bash: /dev/tcp is a bash builtin, and /bin/sh on a
+// Debian-family base is dash, where the path does not exist and every healthy
+// box would be reported unreachable.
+func TestVMProxyProbeUsesBash(t *testing.T) {
+	fake := &fakeEngine{outputs: map[string]string{"inspect": runningBox}}
+	v, _ := testVM(t, fake, false)
+	if err := v.Start(proxySpec(t, "probesh")); err != nil {
+		t.Fatal(err)
+	}
+	probe := fake.callMatching("/dev/tcp/")
+	if probe == nil {
+		t.Fatal("no proxy reachability probe was run")
+	}
+	if !strings.Contains(strings.Join(probe, " "), "bash") {
+		t.Errorf("probe must run under bash, got: %v", probe)
+	}
+}
+
+func TestVMStartQuietWhenProxyReachable(t *testing.T) {
+	fake := &fakeEngine{outputs: map[string]string{"inspect": runningBox}}
+	v, warnings := testVM(t, fake, false)
+	if err := v.Start(proxySpec(t, "reach")); err != nil {
+		t.Fatal(err)
+	}
+	if len(*warnings) != 0 {
+		t.Errorf("a reachable proxy should produce no warnings, got %v", *warnings)
+	}
+}
+
+// inspectPrefix is the engine `inspect` invocation engineInspect issues, up to
+// but not including the resource name. Scripting one resource's inspect to
+// fail while another's succeeds needs the whole prefix.
+const inspectPrefix = "inspect --format {{.State.Running}} {{.State.Pid}} {{.State.Status}} {{.State.ExitCode}} "
+
+// A restart does not run CreateNetwork, so Start arrives with an empty
+// ProxyAddr and has to recover it from the bridge. Getting this wrong is
+// silent: an unpinned sidecar lands on an arbitrary address while the guest's
+// baked-in HTTPS_PROXY still names <subnet>.2, so every network call inside
+// the box hangs forever with nothing logged anywhere.
+func TestVMStartPinsSidecarAfterRestart(t *testing.T) {
+	fake := &fakeEngine{
+		outputs: map[string]string{
+			"inspect":         runningBox,
+			"network inspect": "100.64.7.0/24",
+		},
+		// The sidecar is absent -- the interrupted-create case
+		// ensureSidecarExists exists to recover from.
+		results: map[string]fakeResult{
+			inspectPrefix + "agentbox-restart-proxy": {code: 1, stderr: "No such object"},
+		},
+	}
+	v, warnings := testVM(t, fake, false)
+
+	spec := proxySpec(t, "restart")
+	spec.ProxyAddr = ""
+	if err := v.Start(spec); err != nil {
+		t.Fatal(err)
+	}
+
+	sidecar := fake.callMatching("--name " + spec.ResourceName + "-proxy")
+	if sidecar == nil {
+		t.Fatal("the missing sidecar was not recreated")
+	}
+	if joined := strings.Join(sidecar, " "); !strings.Contains(joined, "--ip 100.64.7.2") {
+		t.Errorf("recreated sidecar is not pinned to the bridge's .2:\n%s", joined)
+	}
+	probe := fake.callMatching("/dev/tcp/")
+	if probe == nil {
+		t.Fatal("no proxy reachability probe was run")
+	}
+	if joined := strings.Join(probe, " "); !strings.Contains(joined, "/dev/tcp/100.64.7.2/3128") {
+		t.Errorf("probe dialled the wrong address:\n%s", joined)
+	}
+	if len(*warnings) != 0 {
+		t.Errorf("a recovered, reachable proxy should produce no warnings, got %v", *warnings)
+	}
+}
+
+// If the address cannot be recovered, Start must refuse. Carrying on would
+// hand the user a box that looks healthy and can reach nothing, which is the
+// hardest failure this tier has to diagnose.
+func TestVMStartRefusesUnresolvableProxyAddr(t *testing.T) {
+	fake := &fakeEngine{
+		outputs: map[string]string{"inspect": runningBox},
+		results: map[string]fakeResult{"network inspect": {code: 1, stderr: "No such network"}},
+	}
+	v, _ := testVM(t, fake, false)
+
+	spec := proxySpec(t, "noaddr")
+	spec.ProxyAddr = ""
+	err := v.Start(spec)
 	if err == nil {
-		t.Fatal("Start accepted a box that exited immediately")
+		t.Fatal("Start accepted a proxy-mode box whose proxy address could not be resolved")
 	}
-	for _, want := range []string{"exited immediately", "139", "vstate.rs:447"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error does not mention %q: %v", want, err)
-		}
+	if !strings.Contains(err.Error(), spec.ResourceName+"-int") {
+		t.Errorf("error should name the bridge it could not inspect: %v", err)
 	}
-	// The guest is gone: probing it would only produce a second, misleading
-	// failure about the egress path.
-	if fake.call("exec") != nil {
-		t.Error("the egress probe must not run against a box that already exited")
+	if c := fake.call("create"); c != nil {
+		t.Errorf("no container should be created once the address is unresolvable, got %v", c)
+	}
+}
+
+func TestVMStartRefusesDeadGuest(t *testing.T) {
+	// `start` exits 0 but the guest aborted a moment later: the engine
+	// reports it exited, and the failure must be named here rather than
+	// surfacing as the next command failing to enter the box.
+	fake := &fakeEngine{outputs: map[string]string{"inspect": "false 0 exited 1"}}
+	v, _ := testVM(t, fake, false)
+	err := v.Start(proxySpec(t, "dead"))
+	if err == nil {
+		t.Fatal("Start accepted a guest that exited immediately")
+	}
+	if !strings.Contains(err.Error(), "exited immediately") {
+		t.Errorf("error should name the dead guest: %v", err)
 	}
 }
 
@@ -388,28 +493,95 @@ func TestVMCreateNetworkGatewayedSubnet(t *testing.T) {
 	}}
 	v, _ := testVM(t, fake, false)
 
-	if err := v.CreateNetwork(proxySpec(t, "t6")); err != nil {
+	spec := proxySpec(t, "t6")
+	if err := v.CreateNetwork(spec); err != nil {
 		t.Fatal(err)
 	}
-	var create []string
-	for _, c := range fake.calls {
-		if len(c) >= 2 && c[0] == "network" && c[1] == "create" {
-			create = c
-		}
-	}
+	create := fake.callMatching("-int")
 	if create == nil {
-		t.Fatal("no `network create` call")
+		t.Fatal("no `network create` call for the box network")
 	}
 	joined := strings.Join(create, " ")
 	for _, want := range []string{
 		"--internal",
 		"--subnet 100.64.1.0/24", // 100.64.0.0/24 was taken
-		"--gateway 100.64.1.1",   // the .1 proxyd binds and the guest routes through
+		"--gateway 100.64.1.1",
 		"agentbox-t6-int",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("network create missing %q:\n%s", want, joined)
 		}
+	}
+	// The sidecar address must land inside the allocated subnet.
+	if spec.ProxyAddr != "100.64.1.2" {
+		t.Errorf("ProxyAddr = %q, want 100.64.1.2 (inside the allocated subnet)", spec.ProxyAddr)
+	}
+	// Proxy mode also needs the egress network the sidecar straddles.
+	if fake.callMatching("-egress") == nil {
+		t.Error("proxy mode created no egress network")
+	}
+}
+
+// Open mode is the only mode where the box network is not --internal; in
+// proxy and off mode a tool that ignores HTTPS_PROXY must fail closed.
+func TestVMNetworkInternalExceptOpenMode(t *testing.T) {
+	for _, tc := range []struct {
+		mode         string
+		wantInternal bool
+	}{
+		{netpol.ModeProxy, true},
+		{netpol.ModeOff, true},
+		{netpol.ModeOpen, false},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			fake := &fakeEngine{outputs: map[string]string{"network ls": ""}}
+			v, _ := testVM(t, fake, false)
+			spec := proxySpec(t, "net-"+tc.mode)
+			spec.Policy = &netpol.Policy{Mode: tc.mode}
+			if err := v.CreateNetwork(spec); err != nil {
+				t.Fatal(err)
+			}
+			joined := strings.Join(fake.callMatching("-int"), " ")
+			if got := strings.Contains(joined, "--internal"); got != tc.wantInternal {
+				t.Errorf("mode %q: --internal = %v, want %v:\n%s", tc.mode, got, tc.wantInternal, joined)
+			}
+		})
+	}
+}
+
+// Subnet allocation surveys the engine's networks and then creates one, which
+// is check-then-act against state agentbox does not own: two boxes starting at
+// once can pick the same free /24 and the engine rejects the loser. The loser
+// must re-survey and take the next one, not fail the box.
+func TestVMCreateNetworkRetriesOnSubnetCollision(t *testing.T) {
+	fake := &fakeEngine{
+		outputs: map[string]string{"network ls": ""},
+		// The first create loses the race; later ones succeed.
+		results: map[string]fakeResult{
+			"network create --subnet 100.64.0.0/24": {
+				code: 1, stderr: "Pool overlaps with other one on this address space",
+			},
+		},
+	}
+	v, _ := testVM(t, fake, false)
+	spec := proxySpec(t, "race")
+	if err := v.CreateNetwork(spec); err != nil {
+		t.Fatalf("a lost subnet race must be retried, not fatal: %v", err)
+	}
+	// It must have moved on to a different subnet rather than retrying the
+	// same one forever.
+	var attempted []string
+	for _, c := range fake.calls {
+		joined := strings.Join(c, " ")
+		if strings.Contains(joined, "network create --subnet") {
+			attempted = append(attempted, joined)
+		}
+	}
+	if len(attempted) < 2 {
+		t.Fatalf("expected a retry after the collision, got %v", attempted)
+	}
+	if spec.ProxyAddr == "100.64.0.2" {
+		t.Errorf("ProxyAddr still points into the subnet that lost the race: %s", spec.ProxyAddr)
 	}
 }
 
@@ -431,235 +603,84 @@ func TestVMAllocateSubnetExhausted(t *testing.T) {
 	}
 }
 
-func TestResolveVMRuntime(t *testing.T) {
-	prev := listEngineRuntimes
-	listEngineRuntimes = func(string) []string { return nil }
-	defer func() { listEngineRuntimes = prev }()
-	cases := []struct {
-		probed                  []string
-		runtime, hypervisor     string
-		wantEngine, wantRuntime string
-		wantErr                 bool
-	}{
-		{[]string{"docker/kata"}, "auto", "auto", "docker", "kata", false},
-		{[]string{"docker/kata"}, "", "", "docker", "kata", false},
-		{[]string{"docker/kata"}, "kata", "auto", "docker", "kata", false},
-		{[]string{"docker/kata-clh"}, "auto", "cloud-hypervisor", "docker", "kata-clh", false},
-		{[]string{"docker/kata"}, "auto", "cloud-hypervisor", "", "", true},
-		{[]string{"garbage"}, "auto", "auto", "", "", true},
-		{nil, "auto", "auto", "", "", true},
-
-		// krun is refused by name, and the refusal cannot depend on the host:
-		// it holds whether or not the probe found something to run it with.
-		{[]string{"docker/kata"}, "krun", "auto", "", "", true},
-		{[]string{"docker/kata"}, "auto", "libkrun", "", "", true},
-		{[]string{"podman/krun"}, "krun", "libkrun", "", "", true},
-		{[]string{"podman/krun"}, "kata", "libkrun", "", "", true}, // contradictory
-		{nil, "krun", "auto", "", "", true},
-
-		// A host with a VM runtime under each engine must be able to name
-		// either: preferring the first at probe time must not make the second
-		// unreachable to an explicit request.
-		{[]string{"docker/kata", "podman/kata-clh"}, "auto", "cloud-hypervisor", "podman", "kata-clh", false},
-		{[]string{"docker/kata", "podman/kata-clh"}, "kata", "auto", "docker", "kata", false},
-		{[]string{"docker/kata", "podman/kata-clh"}, "auto", "auto", "docker", "kata", false},
-		{[]string{"podman/kata-clh", "docker/kata"}, "auto", "auto", "podman", "kata-clh", false},
-		{[]string{"docker/kata-clh", "podman/kata-clh"}, "auto", "qemu", "", "", true},
-	}
-	for _, c := range cases {
-		engine, runtime, err := ResolveVMRuntime(c.probed, c.runtime, c.hypervisor)
-		if c.wantErr != (err != nil) {
-			t.Errorf("ResolveVMRuntime(%q,%q,%q): err = %v, wantErr %v", c.probed, c.runtime, c.hypervisor, err, c.wantErr)
-			continue
-		}
-		if engine != c.wantEngine || runtime != c.wantRuntime {
-			t.Errorf("ResolveVMRuntime(%q,%q,%q) = %q,%q; want %q,%q", c.probed, c.runtime, c.hypervisor, engine, runtime, c.wantEngine, c.wantRuntime)
-		}
-	}
-}
-
-// The refusal has to say what is wrong and what to do instead. The generic
-// "not configured on this host" message sends the user off to install a
-// runtime that cannot work here however they change the host.
-func TestResolveVMRuntimeRefusesKrunByName(t *testing.T) {
-	prev := listEngineRuntimes
-	listEngineRuntimes = func(string) []string { return nil }
-	defer func() { listEngineRuntimes = prev }()
-
-	for _, c := range []struct{ runtime, hypervisor string }{
-		{"krun", "auto"},
-		{"auto", "libkrun"},
-		{"krun", "libkrun"},
+func TestSplitVMRuntime(t *testing.T) {
+	for in, want := range map[string][2]string{
+		"docker/kata":      {"docker", "kata"},
+		"docker/kata-qemu": {"docker", "kata-qemu"},
+		"":                 {"docker", "kata"}, // defensive default
 	} {
-		// Named on a host that has krun to run it with, so the refusal is
-		// visibly a property of the runtime and not of this machine.
-		_, _, err := ResolveVMRuntime([]string{"podman/krun", "docker/kata"}, c.runtime, c.hypervisor)
-		if err == nil {
-			t.Fatalf("runtime=%q hypervisor=%q was accepted; krun cannot serve the vm tier", c.runtime, c.hypervisor)
-		}
-		for _, want := range []string{"exec", "crun#2090", "kata"} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("runtime=%q hypervisor=%q: refusal does not mention %q: %v", c.runtime, c.hypervisor, want, err)
-			}
+		engine, runtime := SplitVMRuntime(in)
+		if engine != want[0] || runtime != want[1] {
+			t.Errorf("SplitVMRuntime(%q) = %q, %q; want %q, %q", in, engine, runtime, want[0], want[1])
 		}
 	}
 }
 
-// A request that no engine can satisfy must name every runtime it did find,
-// across engines — the message is the only thing telling the user what to
-// install, and a truncated one sends them after the wrong engine.
-func TestResolveVMRuntimeErrorNamesAllEngines(t *testing.T) {
-	prev := listEngineRuntimes
-	listEngineRuntimes = func(engine string) []string {
-		if engine == "docker" {
-			return []string{"runc", "kata"}
-		}
-		return nil
-	}
-	defer func() { listEngineRuntimes = prev }()
-
-	_, _, err := ResolveVMRuntime([]string{"docker/kata", "podman/kata-qemu"}, "auto", "cloud-hypervisor")
-	if err == nil {
-		t.Fatal("expected an error: no engine provides kata-clh")
-	}
-	for _, want := range []string{"kata-clh", "docker/kata", "docker/runc", "podman/kata-qemu"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error should mention %q, got: %v", want, err)
-		}
-	}
-}
-
-func TestAvailabilityVMRuntimes(t *testing.T) {
-	// Availability records built before Runtimes existed (and the container
-	// tier, which has no runtime list) must still resolve through Runtime.
-	if got := (Availability{Runtime: "docker/kata"}).VMRuntimes(); len(got) != 1 || got[0] != "docker/kata" {
-		t.Errorf("VMRuntimes() = %q; want [docker/kata]", got)
-	}
-	av := Availability{Runtime: "docker/kata", Runtimes: []string{"docker/kata", "podman/kata-clh"}}
-	if got := av.VMRuntimes(); len(got) != 2 || got[1] != "podman/kata-clh" {
-		t.Errorf("VMRuntimes() = %q; want both candidates", got)
-	}
-	if got := (Availability{}).VMRuntimes(); got != nil {
-		t.Errorf("VMRuntimes() = %q; want nil", got)
-	}
-}
-
-// Two runtimes are excluded from selection for the same category of reason —
-// the runtime cannot deliver something this tier is built on — and neither
-// may be reached by `auto` on a daemon that happens to have it registered.
-func TestPickVMRuntimeExcludesUnusableRuntimes(t *testing.T) {
-	// Appendix B: Firecracker MUST NOT be used — it has no virtiofs, and
-	// the share layer hard-requires it.
+func TestPickVMRuntimePrefersKata(t *testing.T) {
+	// kata-fc is deliberately absent from the preference list: Firecracker
+	// has no virtiofs, which the share layer hard-requires.
 	if got := pickVMRuntime([]string{"runc", "kata-fc"}); got != "" {
-		t.Fatalf("kata-fc must never be selected, got %q", got)
+		t.Errorf("kata-fc must not be selected, got %q", got)
 	}
-	if got := pickVMRuntime([]string{"runc", "kata-fc", "kata-clh"}); got != "kata-clh" {
-		t.Fatalf("want kata-clh, got %q", got)
-	}
-	// krun: nothing can enter a box it created (containers/crun#2090).
-	if got := pickVMRuntime([]string{"runc", "krun"}); got != "" {
-		t.Fatalf("krun must never be selected, got %q", got)
-	}
-	if got := pickVMRuntime([]string{"runc", "krun", "kata"}); got != "kata" {
-		t.Fatalf("want kata, got %q", got)
+	if got := pickVMRuntime([]string{"runc", "kata-clh", "kata"}); got != "kata" {
+		t.Errorf("preference order not honored, got %q", got)
 	}
 }
 
-// stubHostProbe replaces the host-probe seams for one test: present names the
-// binaries on PATH, runtimes the runtime names each reachable engine reports
-// (an engine absent from the map is installed but not answering).
-func stubHostProbe(t *testing.T, present []string, runtimes map[string][]string) {
-	t.Helper()
-	oldLook, oldNames, oldReach := lookPath, engineRuntimeNames, engineReachable
-	t.Cleanup(func() { lookPath, engineRuntimeNames, engineReachable = oldLook, oldNames, oldReach })
-
-	have := map[string]bool{}
-	for _, name := range present {
-		have[name] = true
-	}
-	lookPath = func(name string) (string, error) {
-		if have[name] {
-			return "/usr/bin/" + name, nil
+// A podman-only host must be reported as unavailable with the reason, not
+// quietly passed over: podman's VM path is libkrun, which implements no exec
+// callback, so a box created under it could never be entered.
+func TestDetectVMRuntimePodmanOnlyIsUnavailableWithReason(t *testing.T) {
+	prevLook := lookPath
+	t.Cleanup(func() { lookPath = prevLook })
+	lookPath = func(bin string) (string, error) {
+		if bin == "podman" {
+			return "/usr/bin/podman", nil
 		}
 		return "", exec.ErrNotFound
 	}
-	engineRuntimeNames = func(bin string) ([]string, error) {
-		names, ok := runtimes[filepath.Base(bin)]
-		if !ok {
-			return nil, fmt.Errorf("daemon not reachable")
+	runtime, detail := detectVMRuntime()
+	if runtime != "" {
+		t.Fatalf("podman must not yield a vm runtime, got %q", runtime)
+	}
+	if !strings.Contains(detail, "podman") || !strings.Contains(detail, "Docker + Kata") {
+		t.Errorf("reason should name podman and what is required instead: %q", detail)
+	}
+}
+
+func TestDetectVMRuntimeDocker(t *testing.T) {
+	prevLook, prevNames := lookPath, engineRuntimeNames
+	t.Cleanup(func() { lookPath, engineRuntimeNames = prevLook, prevNames })
+	lookPath = func(bin string) (string, error) {
+		if bin == "docker" {
+			return "/usr/bin/docker", nil
 		}
-		return names, nil
+		return "", exec.ErrNotFound
 	}
-	engineReachable = func(bin string) bool {
-		_, ok := runtimes[filepath.Base(bin)]
-		return ok
+	engineRuntimeNames = func(string) ([]string, error) { return []string{"runc", "kata"}, nil }
+
+	runtime, _ := detectVMRuntime()
+	if runtime != "docker/kata" {
+		t.Errorf("runtime = %q, want docker/kata", runtime)
 	}
 }
 
-// An installed krun is not a candidate — but it is not passed over in silence
-// either: `doctor` and `backends` are where the user goes to find out why the
-// tier is unavailable, and "no VM runtime" would send them to install the one
-// they already have.
-func TestDetectVMRuntimesRefusesKrun(t *testing.T) {
-	stubHostProbe(t, []string{"podman", "krun"}, map[string][]string{"podman": nil})
-
-	candidates, detail := detectVMRuntimes()
-	if len(candidates) != 0 {
-		t.Fatalf("krun must not be a candidate, got %q", candidates)
-	}
-	for _, want := range []string{"krun found but unusable", "exec", "crun#2090", "Kata"} {
-		if !strings.Contains(detail, want) {
-			t.Errorf("detail does not mention %q: %s", want, detail)
+func TestDetectVMRuntimeDockerWithoutKata(t *testing.T) {
+	prevLook, prevNames := lookPath, engineRuntimeNames
+	t.Cleanup(func() { lookPath, engineRuntimeNames = prevLook, prevNames })
+	lookPath = func(bin string) (string, error) {
+		if bin == "docker" {
+			return "/usr/bin/docker", nil
 		}
+		return "", exec.ErrNotFound
 	}
-}
+	engineRuntimeNames = func(string) ([]string, error) { return []string{"runc"}, nil }
 
-// Not installed and installed-but-unusable are different situations, and the
-// message must not tell someone to install what would not help.
-func TestDetectVMRuntimesKrunNotInstalled(t *testing.T) {
-	stubHostProbe(t, []string{"podman"}, map[string][]string{"podman": nil})
-
-	candidates, detail := detectVMRuntimes()
-	if len(candidates) != 0 {
-		t.Fatalf("no runtime is installed; got candidates %q", candidates)
+	runtime, detail := detectVMRuntime()
+	if runtime != "" {
+		t.Fatalf("no kata runtime configured, got %q", runtime)
 	}
-	if !strings.Contains(detail, "no krun binary on PATH") || !strings.Contains(detail, "crun#2090") {
-		t.Errorf("detail should name both the absence and the refusal: %s", detail)
-	}
-}
-
-func TestDetectVMRuntimesDocker(t *testing.T) {
-	// A daemon with krun registered alongside kata: kata is the candidate.
-	stubHostProbe(t, []string{"docker"}, map[string][]string{"docker": {"runc", "krun", "kata"}})
-	if candidates, detail := detectVMRuntimes(); len(candidates) != 1 || candidates[0] != "docker/kata" {
-		t.Errorf("detectVMRuntimes() = %q (%s); want [docker/kata]", candidates, detail)
-	}
-
-	// krun alone is no candidate whichever engine registers it.
-	stubHostProbe(t, []string{"docker"}, map[string][]string{"docker": {"runc", "krun"}})
-	candidates, detail := detectVMRuntimes()
-	if len(candidates) != 0 {
-		t.Errorf("krun must not be a candidate under docker either, got %q", candidates)
-	}
-	if !strings.Contains(detail, "no kata runtime configured") {
-		t.Errorf("detail should name what the daemon is missing: %s", detail)
-	}
-}
-
-// On a host whose only VM runtime is krun the tier is unavailable, with a
-// reason that says why. `min_isolation = "vm"` then exits 69 naming it, which
-// is the correct treatment of an unsatisfiable floor — the alternative is a
-// box that comes up and cannot be entered.
-func TestProbeVMKrunOnlyHostIsUnavailable(t *testing.T) {
-	stubHostProbe(t, []string{"podman", "krun"}, map[string][]string{"podman": nil})
-
-	av := probeVM()
-	if av.Available {
-		t.Fatal("the vm tier must not be available on a krun-only host")
-	}
-	for _, want := range []string{"exec", "crun#2090"} {
-		if !strings.Contains(av.Reason, want) {
-			t.Errorf("reason does not mention %q: %s", want, av.Reason)
-		}
+	if !strings.Contains(detail, "daemon.json") {
+		t.Errorf("reason should say how to fix it: %q", detail)
 	}
 }

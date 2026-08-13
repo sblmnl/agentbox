@@ -10,15 +10,12 @@ import (
 	"time"
 )
 
-// Two-level locking:
+// One box per workspace root means one lock per box, and with it the whole
+// lock-ordering problem goes away: there is no second level to acquire out of
+// order, so no deadlock to design against.
 //
-//	create/remove a box, set the default box  -> exclusive project lock
-//	recreate/start/stop a box                 -> exclusive box lock
-//	run/attach against a running box          -> shared box lock
-//
-// Box locks are acquired after the project lock and released in reverse
-// order; the API makes the other order unrepresentable by requiring a
-// *ProjectLock to take a box lock while the project lock is held.
+//	create/remove/recreate/start/stop a box -> exclusive box lock
+//	run against a running box               -> shared box lock
 //
 // Locks are flock(2)-based: a lock dies with its holder, so a killed
 // process cannot leave a stale lock — acquisition succeeds and the pid file
@@ -29,8 +26,6 @@ type Lock struct {
 	f    *os.File
 	path string
 }
-
-type ProjectLock struct{ Lock }
 
 const lockTimeout = 10 * time.Second
 
@@ -78,29 +73,14 @@ func (l *Lock) Release() {
 	l.f = nil
 }
 
-// LockProject takes the exclusive project-level lock guarding box creation
-// and removal, name allocation, default-box selection, and max_boxes
-// enforcement.
-func (s *Store) LockProject(key string) (*ProjectLock, error) {
-	l, err := acquire(filepath.Join(s.ProjectDir(key), "lock"), true, lockTimeout)
-	if err != nil {
-		return nil, err
-	}
-	return &ProjectLock{*l}, nil
+// LockBoxExclusive guards a box's lifecycle: creation, removal, recreation,
+// start and stop.
+func (s *Store) LockBoxExclusive(key string) (*Lock, error) {
+	return acquire(filepath.Join(s.BoxDir(key), "lock"), true, lockTimeout)
 }
 
-// LockBoxExclusive guards one box's lifecycle (recreate, start, stop). The
-// project lock must be held, enforcing acquisition order.
-func (s *Store) LockBoxExclusive(pl *ProjectLock, key, instance string) (*Lock, error) {
-	if pl == nil {
-		return nil, fmt.Errorf("internal error: box lock requested without the project lock (ordering violation)")
-	}
-	return acquire(filepath.Join(s.BoxDir(key, instance), "lock"), true, lockTimeout)
-}
-
-// LockBoxShared is the run/attach lock. Concurrent runs against different
-// boxes never contend beyond a brief project-lock read, so the shared lock
-// is taken directly on the box.
-func (s *Store) LockBoxShared(key, instance string) (*Lock, error) {
-	return acquire(filepath.Join(s.BoxDir(key, instance), "lock"), false, lockTimeout)
+// LockBoxShared is the run lock: several commands may run inside one box at
+// once, but none may run while it is being created or torn down.
+func (s *Store) LockBoxShared(key string) (*Lock, error) {
+	return acquire(filepath.Join(s.BoxDir(key), "lock"), false, lockTimeout)
 }

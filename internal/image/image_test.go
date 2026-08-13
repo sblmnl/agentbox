@@ -12,10 +12,7 @@ import (
 func cfgWith(t *testing.T, toml string) *config.Config {
 	t.Helper()
 	tmp := t.TempDir()
-	res, err := config.Load(config.LoadOptions{
-		SystemPath:    tmp + "/none.toml",
-		UserConfigDir: tmp,
-	})
+	res, err := config.Load(config.LoadOptions{UserConfigDir: tmp})
 	if err != nil {
 		t.Fatal(err)
 	}

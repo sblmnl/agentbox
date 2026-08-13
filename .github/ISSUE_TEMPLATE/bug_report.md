@@ -24,8 +24,8 @@ $ agentbox ...
 
 ```console
 $ agentbox version --json
-$ agentbox doctor
+$ agentbox status
 ```
 
 **Relevant output** (`agentbox --verbose ...`, `agentbox config --origin`,
-`agentbox mounts` as applicable)
+`agentbox --dry-run --json` as applicable)

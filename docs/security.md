@@ -18,7 +18,7 @@ isolation tiers are **not** equivalent.
 
 The accurate claim is narrower: the blast radius of an agent mistake is
 reduced to one workspace tree and one egress allowlist, both inspectable
-beforehand (`agentbox mounts`, `masks`, `config --origin`, `--dry-run`) and
+beforehand (`agentbox --dry-run --json`, `config --origin`) and
 logged after (`logs --denied`). That is what makes skipping interactive
 approval a defensible engineering decision rather than a reckless one. It is
 not the same claim as safety, and the two tiers do not reduce that radius
@@ -54,7 +54,7 @@ in.
 | Setuid removal | Yes | Yes (image property) |
 | Read-only root | Yes | Guest-local, weaker meaning |
 | Resource limits | Host cgroup, agent cannot raise | Guest-visible; a guest-root agent may raise in-guest limits |
-| Egress control | Host-side sidecar proxy | Host-side proxy daemon over vsock |
+| Egress control | Sidecar proxy, reached by name | Sidecar proxy, reached by pinned IP |
 | Inter-box reachability | Denied by network topology | Denied by network topology |
 | Cross-box state access | Denied — separate volumes and mask views | Denied — separate disks and mask views |
 | Startup cost | ~100 ms | seconds |
@@ -63,13 +63,13 @@ in.
 
 > **Implementation status:** this release implements both tiers. The `vm`
 > tier runs on an OCI-consuming VM runtime — Kata Containers, via docker;
-> libkrun is [not usable](install.md#libkrun-is-not-usable) because nothing
+> Podman is not offered for this tier because nothing
 > can enter a box it created — and requires `/dev/kvm`; where the runtime or KVM is
 > missing, `min_isolation = "vm"` exits 69 naming what would fix it. The
 > Layer 3 filtered share (`mask_mode = "filter"`) ships in this release:
 > under `vm`, `auto` resolves to `filter` where the seam is deliverable
 > (`/dev/fuse` present, plus either agentbox running as root or the setuid
-> `fusermount3` helper with `user_allow_other` enabled — `agentbox doctor`
+> `fusermount3` helper with `user_allow_other` enabled — `agentbox status`
 > reports which way `auto` resolves on this host) and falls back to `view`
 > with a warning otherwise; an explicit `"filter"` that cannot be
 > delivered is an error, never a downgrade. The host-side mask view
@@ -87,11 +87,10 @@ the host.
 
 Boxes cannot reach one another, over the network or through shared state.
 Each box gets its own network, its own persistent home, and its own mask
-view: a project holding four boxes is four independent blast radii, not one
-shared one. The single deliberate exception is `tree_mode = "shared"`, where
-boxes see one working tree by explicit configuration — warned at creation,
-because it is the one place the boundary between boxes is intentionally
-porous.
+view: four boxes are four independent blast radii, not one shared one.
+Because a box is identified by its workspace root, two boxes are necessarily
+two directories — so they do not share a working tree either, and there is
+no configuration that makes them.
 
 ## Masking, and its limits
 
@@ -141,10 +140,8 @@ Its documented limitations:
    `[masking].tmpfs_size`. Under `filter` mode this does not apply; there
    is no tmpfs, and a masked directory simply does not exist in the guest.
 3. **`.git/` should not be masked.** It costs diff, commit, and history for
-   almost no gain. `doctor` warns when a config does this.
-4. **Anything in `[[workspace.mounts]]` bypasses masking** unless
-   separately matched.
-5. **Masking is not a secrets manager.** For credentials that need not sit
+   almost no gain. It is deliberately absent from the scaffolded patterns.
+4. **Masking is not a secrets manager.** For credentials that need not sit
    in the tree at all, prefer `[variables.passthrough]` or keeping the
    secret host-side. Masking exists for the files an application genuinely
    needs on disk to run — a dev TLS key, a seeded database — where deleting
@@ -162,66 +159,91 @@ denials, is logged (`agentbox logs --denied`). `deny` entries are evaluated
 first and win.
 
 Known limitation: an HTTP CONNECT proxy cannot carry SSH. Git operations
-must use HTTPS remotes in `proxy` mode; `doctor` detects SSH remotes rather
-than leaving you to discover this mid-session.
+must use HTTPS remotes in `proxy` mode.
 
 ### How the guest reaches the proxy
 
-The two tiers place the proxy differently. Under `container` it is a sidecar
-container straddling the box's internal network and an egress network. Under
-`vm` it is a **host daemon reached over vsock**: a small forwarder inside the
-box listens on loopback (that is what `HTTPS_PROXY` points at) and carries
-the bytes to the daemon over the hypervisor's vsock channel. The box's own
-network stays `--internal` and carries no egress at all.
+Both tiers use the same topology, which is what lets one allowlist mean one
+thing: a per-box `--internal` bridge with no route off it, and a squid
+sidecar straddling that bridge and a second, routable network. The policy
+engine, its generated configuration and its hardening are shared code.
 
-vsock rather than the bridge, for a reason worth stating plainly: a VM
-guest's path to a host process is ordinary IP traffic arriving at the host,
-so it is subject to the host's `INPUT` policy and to any VPN kill-switch
-filtering by source address. A default-deny `INPUT` chain, or a kill-switch
-that treats only RFC 1918 as "local network", silently drops it — the box
-comes up healthy and every network call inside it hangs. vsock carries no IP
-address, crosses no bridge, and is not visible to netfilter, so egress
-cannot be severed by host firewall or VPN state. The failure mode it
-replaces was indistinguishable from a hung agent; if the path does break,
-agentbox now fails the box at start naming the cause rather than letting it
-hang.
+The `vm` tier differs in exactly one respect, for one reason. A Kata guest
+*can* reach a sibling container over an ordinary bridge — but it *cannot*
+reach the engine's embedded DNS resolver, which the engine publishes at
+`127.0.0.11` inside the network namespace while the guest's loopback is its
+own. Container names therefore do not resolve from inside a VM, so the `vm`
+tier addresses its sidecar by a **pinned IP** instead of by name.
 
-Connections are attributed to a box by a per-box token, minted at create
-time and never reused, so one shared listener cannot blur two boxes'
-policies: a connection whose token matches no running box is closed without
-being served. The audit log records the kernel-supplied peer context id
-(`cid<n>`), which a guest cannot forge, in place of the client IP.
+This has a pleasant consequence. In `proxy` mode the guest needs no resolver
+at all: it sends `CONNECT example.com:443` to an IP, and the proxy does the
+resolving. The box has no DNS channel of its own, and so no DNS-shaped
+exfiltration path. Only `open` mode needs a resolver, and there agentbox
+bind-mounts a generated `/etc/resolv.conf` carrying the host's real upstream
+nameservers. (`--dns` does not achieve this: on a user-defined network the
+engine still writes `127.0.0.11` into the container's `resolv.conf` and
+merely redirects the embedded resolver's upstream, which the guest still
+cannot reach.)
+
+After starting a proxy-mode box, agentbox probes from inside the guest that
+the sidecar is actually reachable. A failed probe **warns** rather than
+failing the box: the policy is enforced at the proxy, so an unreachable
+sidecar is a box with *no* egress, not one with widened egress. What it must
+never do is stay silent — a box whose every network call hangs is the most
+confusing failure this tier has.
 
 ## Guest root
 
 Under the `container` tier, guest root is denied by construction: no
-`sudo`, setuid bits stripped, and `guest_root = "allow"` under
-`[security.container]` is a **parse error**, not a setting. The reasoning: a
+`sudo`, setuid bits stripped, and the backend refuses to build a
+container-tier box that asks for guest root. The reasoning: a
 guest process with `CAP_SYS_ADMIN` could unmount a mask and read through it,
 converting every mask from a boundary into a suggestion — silently, with no
 error and no log line. Agents frequently want root to install packages; the
 `vm` tier is where that request can be granted, because mask enforcement
 lives outside the guest.
 
-## Workspace config trust
+## A committed config outranks yours
 
 `agentbox.toml` is committed, so cloning a repository and running `agentbox`
-executes configuration you did not write. Host-side `[hooks]` (commands run
-on **your host**) and `[[workspace.mounts]]` (which can mount `~/.ssh` into
-the guest) are refused until the file has been reviewed and accepted with
-`agentbox trust`. Any edit to the file — or to anything it `extends` —
-invalidates the trust record. Inspection commands (`config`, `mounts`,
-`doctor`, …) still work against an untrusted config; they are how you review
-it.
+applies configuration you did not write, above your own user configuration.
+
+The schema is deliberately shaped so that this cannot be worse than a weaker
+box. There are no hooks — nothing in a workspace config causes agentbox to
+execute anything on your host — and no host-path mounts, so a repository
+cannot ask for `~/.ssh` to appear in the guest. What it *can* do is request
+a lower isolation floor, an open network, or a weaker mask mode.
+
+It is allowed to, and it cannot do so quietly. Any workspace value that
+loosens a ranked security key relative to a lower layer produces a warning
+on **every** invocation, naming the key, both values, and the file
+responsible:
+
+```console
+$ agentbox
+warning: security.min_isolation: /src/myproject/agentbox.toml lowered this
+  from "vm" to "container" (~/.config/agentbox/config.toml set "vm"); the
+  workspace value is in effect -- pass --min-isolation to override it
+```
+
+Tightening is silent, because a project asking for a stronger box is a
+project config doing its job. A flag overrides the workspace value and
+clears the warning, because a flag is typed by the person at the prompt.
+The ranked keys are listed in [configuration.md](configuration.md#when-the-workspace-layer-weakens-something).
+
+This replaces the trust/TOFU mechanism an earlier design used. Trust existed
+to gate host-side code execution; with hooks and host mounts absent from the
+schema, there is nothing left for it to gate, and a prompt that must be
+answered before the tool will run is a prompt people learn to dismiss.
 
 ## No silent divergence
 
 One configuration file drives two non-equivalent boundaries, so divergence
 must be loud:
 
-1. `status` prints the active backend, tier, and mask mode on every
-   invocation.
-2. `doctor` names each unavailable backend and why.
+1. Every invocation that starts a box prints the backend, tier, egress mode
+   and mask mode in force; `status` prints the same on demand.
+2. `version` names each unavailable backend and why.
 3. This property table ships in the documentation (`agentbox-security(7)`
    and here), not buried in code.
 4. Backend-specific keys are scope-checked **statically** — a
@@ -229,8 +251,10 @@ must be loud:
    machine, regardless of which backend is active.
 5. `min_isolation` is honored without downgrade. Neither silent nor warned
    downgrade occurs; lowering requires `--force-isolation`, which is
-   recorded in the box's metadata, flagged by `status` and `ls`, and warned
-   about on every invocation.
+   recorded in the box's metadata, flagged by `status`, and warned about on
+   every invocation.
+6. A workspace config that weakens a ranked security key warns on every
+   invocation, naming the key and both values.
 
 The failure mode defended against is concrete: a developer writes and
 verifies a configuration on a bare-metal workstation, a teammate runs it

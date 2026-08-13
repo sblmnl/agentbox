@@ -13,20 +13,12 @@ type Config struct {
 	Version int
 
 	Box struct {
-		Name           string
-		Profile        string
 		DefaultCommand []string
-		DefaultAgent   string
 		IdleTimeout    string
-	}
-	Project struct {
-		MaxBoxes int
 	}
 	Workspace struct {
 		Mount    string
 		ReadOnly bool
-		TreeMode string
-		Mounts   []Mount
 	}
 	Toolchains map[string]string
 	Image      struct {
@@ -70,11 +62,8 @@ type Config struct {
 			CapAdd          []string
 			Userns          string
 			Seccomp         string
-			GuestRoot       string
 		}
 		VM struct {
-			Hypervisor    string
-			Runtime       string
 			GuestRoot     string
 			NestedDocker  bool
 			MemoryBacking string
@@ -87,22 +76,6 @@ type Config struct {
 	}
 	Variables   map[string]string
 	Passthrough []string
-	Hooks       struct {
-		PreUp   []string
-		PostUp  []string
-		PreExec []string
-	}
-	Limits struct {
-		MaxBoxes       int
-		MaxTotalMemory string
-		OnLimit        string
-	}
-}
-
-type Mount struct {
-	Source string `json:"source"`
-	Target string `json:"target"`
-	Mode   string `json:"mode"`
 }
 
 // BuiltinDefaults is the lowest configuration layer, compiled in.
@@ -113,13 +86,9 @@ version = 1
 default_command = ["bash", "-l"]
 idle_timeout    = "30m"
 
-[project]
-max_boxes = 4
-
 [workspace]
 mount     = "/workspace"
 readonly  = false
-tree_mode = "auto"
 
 [agents]
 channel = "stable"
@@ -154,11 +123,8 @@ cap_drop          = ["ALL"]
 cap_add           = []
 userns            = "auto"
 seccomp           = "default"
-guest_root        = "deny"
 
 [security.vm]
-hypervisor     = "auto"
-runtime        = "auto"
 guest_root     = "allow"
 nested_docker  = false
 memory_backing = "balloon"
@@ -170,11 +136,6 @@ files_readonly = true
 
 [image]
 base = "ubuntu:26.04"
-
-[limits]
-max_boxes        = 12
-max_total_memory = "48g"
-on_limit         = "error"
 `
 
 // Decode converts a merged raw tree into a typed Config.
@@ -183,17 +144,11 @@ func Decode(tree map[string]any) (*Config, error) {
 	g := getter{tree}
 	c.Version = g.i("version", 1)
 
-	c.Box.Name = g.s("box.name", "")
-	c.Box.Profile = g.s("box.profile", "")
 	c.Box.DefaultCommand = g.list("box.default_command")
-	c.Box.DefaultAgent = g.s("box.default_agent", "")
 	c.Box.IdleTimeout = g.s("box.idle_timeout", "30m")
-	c.Project.MaxBoxes = g.i("project.max_boxes", 4)
 
 	c.Workspace.Mount = g.s("workspace.mount", "/workspace")
 	c.Workspace.ReadOnly = g.b("workspace.readonly", false)
-	c.Workspace.TreeMode = g.s("workspace.tree_mode", "auto")
-	c.Workspace.Mounts = g.mounts("workspace.mounts")
 
 	c.Toolchains = g.smap("toolchains")
 	c.Image.Ref = g.s("image.ref", "")
@@ -230,10 +185,7 @@ func Decode(tree map[string]any) (*Config, error) {
 	c.Security.Container.CapAdd = g.list("security.container.cap_add")
 	c.Security.Container.Userns = g.s("security.container.userns", "auto")
 	c.Security.Container.Seccomp = g.s("security.container.seccomp", "default")
-	c.Security.Container.GuestRoot = g.s("security.container.guest_root", "deny")
 
-	c.Security.VM.Hypervisor = g.s("security.vm.hypervisor", "auto")
-	c.Security.VM.Runtime = g.s("security.vm.runtime", "auto")
 	c.Security.VM.GuestRoot = g.s("security.vm.guest_root", "allow")
 	c.Security.VM.NestedDocker = g.b("security.vm.nested_docker", false)
 	c.Security.VM.MemoryBacking = g.s("security.vm.memory_backing", "balloon")
@@ -245,14 +197,6 @@ func Decode(tree map[string]any) (*Config, error) {
 	c.Variables = g.smap("variables")
 	delete(c.Variables, "passthrough")
 	c.Passthrough = g.list("variables.passthrough.names")
-
-	c.Hooks.PreUp = g.list("hooks.pre_up")
-	c.Hooks.PostUp = g.list("hooks.post_up")
-	c.Hooks.PreExec = g.list("hooks.pre_exec")
-
-	c.Limits.MaxBoxes = g.i("limits.max_boxes", 12)
-	c.Limits.MaxTotalMemory = g.s("limits.max_total_memory", "48g")
-	c.Limits.OnLimit = g.s("limits.on_limit", "error")
 
 	if c.Version != 1 {
 		return nil, fmt.Errorf("version: unsupported config version %d (this release supports version = 1)", c.Version)
@@ -327,35 +271,6 @@ func (g getter) smap(path string) map[string]string {
 	for k, el := range v {
 		if s, ok := el.(string); ok {
 			out[k] = s
-		}
-	}
-	return out
-}
-func (g getter) mounts(path string) []Mount {
-	var out []Mount
-	add := func(m map[string]any) {
-		mt := Mount{Mode: "rw"}
-		if s, ok := m["source"].(string); ok {
-			mt.Source = s
-		}
-		if s, ok := m["target"].(string); ok {
-			mt.Target = s
-		}
-		if s, ok := m["mode"].(string); ok {
-			mt.Mode = s
-		}
-		out = append(out, mt)
-	}
-	switch v := g.at(path).(type) {
-	case []map[string]any:
-		for _, m := range v {
-			add(m)
-		}
-	case []any:
-		for _, el := range v {
-			if m, ok := el.(map[string]any); ok {
-				add(m)
-			}
 		}
 	}
 	return out

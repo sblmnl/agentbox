@@ -49,7 +49,7 @@ $ make all            # gofmt check + vet + build + test
 3. Update the docs that restate the behavior you changed: README, the
    relevant `docs/*.md`, and the man pages under `docs/man/`.
 4. Widening a network **bundle** widens every user's egress policy: bundle
-   changes must appear in CHANGELOG.md with rationale.
+   changes must be justified in the pull request.
 5. Adding a reserved subcommand is a breaking change to the CLI contract —
    expect scrutiny of name collisions with common binaries.
 

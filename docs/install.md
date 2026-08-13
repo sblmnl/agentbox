@@ -18,7 +18,6 @@ to a container or VM backend. This guide covers both.
 - [Runtime setup](#runtime-setup)
   - [Container tier](#container-tier-docker-or-rootless-podman)
   - [VM tier](#vm-tier-kata-containers)
-- [Shell completions](#shell-completions)
 - [Man pages](#man-pages)
 - [Verify the install](#verify-the-install)
 - [First run](#first-run)
@@ -32,11 +31,11 @@ to a container or VM backend. This guide covers both.
 |---|---|
 | **OS** | Linux (`amd64` or `arm64`). agentbox targets Linux only — it drives Linux container/VM runtimes and uses Linux mount namespaces for masking. |
 | **Runtime** (one of) | Docker with Compose v2, **or** rootless Podman — for the `container` tier. Kata Containers via docker, on KVM — for the `vm` tier. See [Runtime setup](#runtime-setup). |
-| **`git`** | Required for the `worktree` and `copy` tree modes, and used by `agentbox doctor` to inspect remotes. The ignore-matcher is also differentially tested against `git check-ignore`. |
+| **`git`** | Used for workspace-root detection, and the ignore-matcher is differentially tested against `git check-ignore`. |
 | **To build** | Go ≥ 1.22 to compile; the repo's toolchain is pinned to Go 1.26 in `go.mod`. |
 
 None of the runtimes is a hard dependency of the *binary* — building
-agentbox on a machine with no runtime succeeds, and `agentbox doctor` then
+agentbox on a machine with no runtime succeeds, and `agentbox version` then
 tells you what's missing. This is deliberate: putting agentbox on a cloud VM
 must not drag in a hypervisor stack it can't use.
 
@@ -58,8 +57,7 @@ $ make install PREFIX="$HOME/.local"      # or a prefix you own, no sudo
 
 `make install` places the binary at `$(PREFIX)/bin/agentbox` and the three
 man pages under `$(PREFIX)/share/man/`. It honors `DESTDIR` for staged
-installs. It does **not** install shell completions — generate those
-separately (see [completions](#shell-completions)).
+installs.
 
 A plain `go build` also works if you only want the binary:
 
@@ -106,16 +104,16 @@ Choose this tier (`min_isolation = "vm"`) when you want a hypervisor
 boundary rather than a shared kernel. It needs:
 
 - **KVM**: `/dev/kvm` present — bare metal, or a VM with nested
-  virtualization enabled. `agentbox doctor` reports whether it's there.
+  virtualization enabled. `agentbox version` reports whether the tier is available.
 - **Kata Containers** driven through Docker (runtimes `kata`, `kata-qemu`,
-  `kata-clh`). See [libkrun is not usable](#libkrun-is-not-usable) for why
+  `kata-clh`). See [why Docker only](#why-docker-only-for-this-tier) for why
   it is the only supported option.
 - **`CAP_SYS_ADMIN`** for agentbox itself, so it can construct the host-side
   mask view. Without it, mask mounts are expressed *inside* the guest and
   agentbox **warns** that a guest-root process could unmount them — no
   silent weakening, but a real caveat.
 
-`agentbox doctor` and `agentbox backends` list every engine/runtime pair
+`agentbox version` lists every backend
 found. Where a host has more than one, `runtime = "auto"` takes the first in
 preference order (`kata`, `kata-qemu`, `kata-clh`; docker before podman);
 set `[security.vm].runtime` or `.hypervisor` explicitly to pin another. A
@@ -150,7 +148,7 @@ the setuid `fusermount3` helper. For that route:
   happens to share your uid, because the alternative is a box that starts and
   then fails opaquely.
 
-`agentbox doctor` reports which route is available and which way `auto`
+`agentbox status` reports which route is available and which way `auto`
 resolves. Note that the **host-side `view`** (Layer 0/2 mounts) still needs
 CAP_SYS_ADMIN — there is no unprivileged equivalent, so a non-root agentbox
 using `view` expresses mask mounts in the guest and warns. Under the vm tier
@@ -158,47 +156,32 @@ the rootless path is therefore `filter`, which is also the stronger mode.
 
 Follow the upstream install docs for
 [Kata Containers](https://katacontainers.io/); then confirm with
-`agentbox doctor`, which lists each backend, its tier, and whether it's
+`agentbox version`, which lists each backend, its tier, and whether it's
 available.
 
-#### libkrun is not usable
+#### Why Docker only for this tier
 
-[libkrun](https://github.com/containers/libkrun), driven through Podman as
-the `krun` OCI runtime, looks like a natural second option for this tier and
-is **not** one. Every agentbox operation on a box is an engine `exec`: the
-box is created running `sleep infinity`, and `up`, `run` and `shell` all
-enter it. crun's libkrun handler implements no `exec` callback — libkrun
-boots a microVM whose init *is* the entrypoint, with no in-guest agent to
-spawn further processes — so a box created under `krun` starts and then
-refuses every command with "the handler does not support exec"
+Podman looks like a natural second option here and is **not** one. Its VM
+path is [libkrun](https://github.com/containers/libkrun), driven as the
+`krun` OCI runtime, and every agentbox operation on a box is an engine
+`exec`: the box is created running `sleep infinity`, and `up`, `run` and
+`shell` all enter it. crun's libkrun handler implements no `exec` callback —
+libkrun boots a microVM whose init *is* the entrypoint, with no in-guest
+agent to spawn further processes — so a box created under `krun` starts and
+then refuses every command with "the handler does not support exec"
 ([containers/crun#2090](https://github.com/containers/crun/issues/2090)).
 Kata works because `kata-agent` and its shim implement exec over vsock.
 
-What agentbox does about it:
+So agentbox does not offer it. There is no `runtime` or `hypervisor`
+configuration key at all: a value that parses, selects, creates a box and
+then cannot be entered is worse than no value. If podman is the only thing
+installed, the `vm` tier reports itself unavailable and says why, and
+`min_isolation = "vm"` exits 69. Install Docker with a Kata runtime, or
+lower the floor deliberately with `--force-isolation container` — which is
+recorded in the box's metadata and warned about on every invocation.
 
-- `krun` is never selected by `auto`, on either engine. If the binary is
-  installed, `agentbox doctor` names it and explains why it is not a
-  candidate, rather than reporting that no VM runtime was found.
-- `runtime = "krun"` or `hypervisor = "libkrun"` is a configuration error
-  (exit 78) naming the exec limitation and pointing here. The values remain
-  valid schema so that this is the message you get.
-- If krun is the only VM runtime on the host, the `vm` tier is unavailable
-  and `min_isolation = "vm"` exits 69. Install Kata, or lower the floor
-  deliberately with `--force-isolation container` — which is recorded in the
-  box's metadata and warned about on every invocation.
-
-## Shell completions
-
-A source build doesn't place completions; generate them from the binary:
-
-```console
-$ agentbox completion bash | sudo tee /usr/share/bash-completion/completions/agentbox >/dev/null
-$ agentbox completion zsh  | sudo tee /usr/share/zsh/site-functions/_agentbox        >/dev/null
-$ agentbox completion fish > ~/.config/fish/completions/agentbox.fish
-```
-
-Or, from a source checkout, `make completions` writes all three into
-`completions/`.
+Podman support for this tier is wanted; it is blocked upstream, not
+declined.
 
 ## Man pages
 
@@ -218,50 +201,48 @@ $ man agentbox
 
 ```console
 $ agentbox version
-$ agentbox doctor
 ```
 
-`agentbox doctor` is the preflight check and the single best signal that the
-install is usable. In a project directory it reports:
+`agentbox version` lists each backend, its tier, and whether it is available
+— and if not, why, with what would fix it.
 
-- the resolved **workspace and project** identity;
-- **configuration** validity and the layers that merged;
-- **workspace trust** — whether a committed config declaring `[hooks]` or
-  `[[workspace.mounts]]` has been reviewed and trusted;
-- each **backend**, its tier, and whether it's available (and if not, why);
-- whether **`/dev/kvm`** is present (for the vm tier);
-- **git remotes** that use SSH — a warning, since proxy-mode egress carries
-  HTTPS, not SSH;
-- whether `.git` is accidentally masked;
-- the **network** policy and whether its allowlist is empty.
+In a project directory, `agentbox --dry-run` is the preflight check: it
+builds the complete plan and changes nothing, so it answers what the agent
+would see and reach before anything is created.
 
-It exits non-zero if it finds issues, so it's safe to gate scripts on.
-`doctor` is one of the read-only commands that runs even against an untrusted
-workspace config, so you can review a freshly cloned repo before trusting it.
+```console
+$ agentbox --dry-run --json
+```
+
+That publishes the resolved backend and tier, the full mask set, the
+effective egress allowlist, the image reference, and the guest working
+directory. `agentbox config --origin` shows where every key came from, and
+`agentbox status` reports an existing box's state and any drift.
 
 ## First run
 
 ```console
 $ cd ~/src/myapp
 $ agentbox init                  # scaffold agentbox.toml + .agentignore
-$ agentbox doctor                # preflight
-$ agentbox --dry-run claude      # print the full plan; create/start nothing
-$ agentbox mounts                # what will the agent see, and why?
+$ agentbox --dry-run             # the full plan: masks, egress, backend
 $ agentbox claude                # run the agent in the box
 ```
 
-If the repo ships a committed `agentbox.toml` with `[hooks]` or
-`[[workspace.mounts]]`, agentbox **refuses to run it (exit 77)** until you
-review the file and run `agentbox trust` — committed config is untrusted by
-default, and any edit re-arms the check. See
+There is one box per workspace root, so there is nothing to name and nothing
+to select: `cd` into the project and you are in its box. For a second box,
+make a second root — `git worktree add ../feature` gets its own.
+
+If the repo ships a committed `agentbox.toml` that weakens a security
+setting relative to your own configuration, agentbox applies it and warns on
+every invocation, naming the key and both values. See
 [docs/configuration.md](configuration.md) for the full config reference.
 
 ## Upgrading
 
 `git pull` in your checkout, then `make install` (or `go build`) again.
-agentbox is pre-1.0 and the config schema may still change; egress-bundle
-changes are listed in `CHANGELOG.md` because they widen policy for everyone
-using that bundle, so read it before upgrading.
+agentbox is pre-1.0 and the config schema may still change. Egress-bundle
+changes widen policy for everyone using that bundle, so they are called out
+in release notes; read them before upgrading.
 
 ## Uninstalling
 
@@ -273,23 +254,21 @@ $ sudo rm /usr/local/bin/agentbox \
           /usr/local/share/man/man7/agentbox-security.7
 ```
 
-agentbox keeps per-project and per-box state under
-`$XDG_STATE_HOME/agentbox` (defaults to `~/.local/state/agentbox`). Remove
-boxes cleanly with `agentbox rm` / `agentbox prune` **before** uninstalling
-so their containers/worktrees are torn down; then delete the state directory
-if you want no trace left.
+agentbox keeps per-box state under `$XDG_STATE_HOME/agentbox` (defaults to
+`~/.local/state/agentbox`). Run `agentbox rm` in each project **before**
+uninstalling so its containers, networks, volumes and image are torn down;
+then delete the state directory if you want no trace left.
 
 ## Troubleshooting
 
 | Symptom | Cause & fix |
 |---|---|
-| `exit 69`, "isolation floor unsatisfiable" | No available backend meets `min_isolation`. Run `agentbox doctor` / `agentbox backends`; install or fix the runtime for that tier, or lower the floor deliberately with `--force-isolation` (recorded in box metadata and warned every run). |
-| `exit 77`, config refused | The committed workspace config declares `[hooks]` or `[[workspace.mounts]]` and isn't trusted. Review the file, then `agentbox trust`. |
+| `exit 69`, "isolation floor unsatisfiable" | No available backend meets `min_isolation`. Run `agentbox version` to see why each tier is unavailable; install or fix the runtime for that tier, or lower the floor deliberately with `--force-isolation` (recorded in box metadata and warned every run). |
 | `exit 78`, invalid config | Static validation failed — an unknown key, or a backend-scoped key in the wrong section (`[security.container]` vs `[security.vm]`). These are hard errors on every machine. Run `agentbox config --origin` to see where each key came from. |
 | `exit 64`, usage error | Bad flags or an unknown subcommand. |
-| `agentbox doctor` warns the vm mask view is guest-side | agentbox lacks `CAP_SYS_ADMIN`. Grant it so the mask view is constructed host-side; otherwise a guest-root process could unmount it. |
+| agentbox warns the vm mask view is guest-side | agentbox lacks `CAP_SYS_ADMIN`. Grant it so the mask view is constructed host-side; otherwise a guest-root process could unmount it. |
 | Git operations fail inside the box | Proxy-mode egress carries HTTPS, not SSH. Switch the remote to an HTTPS URL, or add the needed host to the network allowlist. `agentbox logs --denied` shows what was refused. |
-| `docker compose` not found | You have the old `docker-compose` v1; agentbox needs Compose v2 (the `docker compose` subcommand). Install `docker-compose-v2`, or use rootless Podman. |
+| Every network call in a vm box hangs | The proxy sidecar is not answering; agentbox warns about this at start. `agentbox logs --proxy` shows why. |
 
 agentbox writes all diagnostics to **stderr**; **stdout belongs to the
 in-box command**, and the in-box command's exit code is passed through
