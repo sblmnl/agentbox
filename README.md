@@ -21,7 +21,7 @@ security-sensitive environments until it is.
 > [!NOTE]
 > The original Go prototype lives at
 > [sblmnl/agentbox-prototype](https://github.com/sblmnl/agentbox-prototype).
-> It works and is still useful — both as a reference for the behaviour this
+> It works and is still useful — both as a reference for the behavior this
 > implementation is converging on and as a record of how the design got here —
 > but it is a historical artifact, not the path forward. New work happens in
 > this repository.
